@@ -221,7 +221,7 @@ impl PushConfig{
     }
     pub async fn push_bark(&self, title:&str ,message: &str) -> (bool, String){
         let client = Client::new();
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "title":title,
             "body":message,
             "level":"timeSensitive",
@@ -235,7 +235,17 @@ impl PushConfig{
             "isArchive":1,
 
         });
-        let url = format!("https://api.day.app/{}/", self.bark_token);
+        if let Some((_, quary_string)) = self.bark_token.split_once('?') {
+            if let Some(json_object) = data.as_object_mut() {
+                for pair in quary_string.split('&') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        json_object.insert(key.to_string(), serde_json::json!(value));
+                    }
+                } 
+            }
+        }
+        
+        let url = format!("https://api.day.app/{}", self.bark_token);
         match client.post(&url)
             .json(&data)
             .send()

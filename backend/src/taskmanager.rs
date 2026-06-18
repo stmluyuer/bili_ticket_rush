@@ -329,21 +329,35 @@ impl TaskManager for TaskManagerImpl {
                                     tokio::spawn(async move{
                                         log::debug!("正在获取购票人信息{}",task_id);
                                         let response  = get_buyer_info(cookie_manager).await;
-                                        let success = response.is_ok();
-                                        let buyer_info = match &response{
-                                            Ok(info) => {Some(info.clone())},
-                                            Err(e) => {
-                                                log::error!("获取购票人信息失败，原因：{}",e);
-                                                None
-                                            }
-                                        };
-                                        let message = match &response{
+                                        let (success, buyer_info, message) = match response {
                                             Ok(info) => {
-                                                //log::debug!("项目{}请求成功",info.errno);
-                                                format!("购票人信息请求成功")
+                                                // 成功：按账号 uid 写入本地加密缓存（设备码加密），供下次失败时回退。
+                                                // 仅在列表非空时缓存，避免用空/异常响应覆盖掉之前的有效缓存。
+                                                if !info.data.list.is_empty() {
+                                                    if let Err(e) = common::utils::save_buyer_cache(uid, &info.data.list) {
+                                                        log::warn!("保存购票人缓存失败：{}", e);
+                                                    }
+                                                }
+                                                (true, Some(info), "购票人信息请求成功".to_string())
                                             }
                                             Err(e) => {
-                                                e.to_string()
+                                                log::error!("获取购票人信息失败，原因：{}", e);
+                                                // 失败：尝试从本地加密缓存读取该账号的购票人列表
+                                                match common::utils::load_buyer_cache(uid) {
+                                                    Ok(list) if !list.is_empty() => {
+                                                        log::warn!("已从本地缓存读取账号 {} 的购票人信息（{} 人）", uid, list.len());
+                                                        let cached = BuyerInfoResponse {
+                                                            errno: 0,
+                                                            errtag: 0,
+                                                            msg: String::new(),
+                                                            code: 0,
+                                                            message: String::new(),
+                                                            data: BuyerInfoData { list },
+                                                        };
+                                                        (true, Some(cached), "网络获取购票人失败，已从本地缓存读取".to_string())
+                                                    }
+                                                    _ => (false, None, e),
+                                                }
                                             }
                                         };
                                         let task_result = TaskResult::GetBuyerInfoResult(GetBuyerInfoResult{

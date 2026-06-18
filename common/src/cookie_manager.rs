@@ -37,11 +37,12 @@ pub struct WebData {
 #[derive(Debug, Clone)]
 pub struct CookieManager {
     pub client: Arc<reqwest::Client>,
+    pub h2_client: Arc<reqwest::Client>,
     pub create_type: usize,
     app_data: Option<AppData>,
     pub web_data: Option<WebData>,
     pub cookies: CookiesData,
-    
+
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +115,15 @@ impl CookieManager {
             .cookie_store(true);
                 let client = client_builder.user_agent(ua.clone()).build().unwrap_or_default()
                     ;
+                // createV2 专用客户端：用系统原生 TLS(Windows SChannel)。
+                // 它的 TLS 指纹(ClientHello)在 Windows 上极其常见，比 rustls 更不容易被
+                // gaia 风控按"罕见指纹"标记。仍通过 ALPN 协商 HTTP/2。
+                let h2_client = reqwest::Client::builder()
+                    .cookie_store(true)
+                    .user_agent(ua.clone())
+                    .use_native_tls()
+                    .build()
+                    .unwrap_or_else(|_| client.clone());
 
             //ck部分
                 let (buvid3, buvid4, b_nut) = {
@@ -271,6 +281,15 @@ impl CookieManager {
                 cookies.insert("enable_feed_channel".to_string(), "ENABLE".to_string());
                 cookies.insert("msource".to_string(), msourse.clone());
                 cookies.insert(_obf_key.to_string(), _01x96.clone());
+                let canvas_fp = crate::fe_sign::random_hex_32();
+                let webgl_fp = crate::fe_sign::random_hex_32();
+                let fe_sign = crate::fe_sign::get_fe_sign(crate::fe_sign::WEBVIEW_UA, &canvas_fp, &webgl_fp);
+                cookies.insert("feSign".to_string(), fe_sign);
+                cookies.insert("screenInfo".to_string(), crate::fe_sign::SCREEN_INFO.to_string());
+                cookies.insert("kfcFrom".to_string(), "mall_home_searchhis".to_string());
+                cookies.insert("from".to_string(), "mall_search_discovery".to_string());
+                cookies.insert("kfcSource".to_string(), "bilibiliapp".to_string());
+                cookies.insert("mSource".to_string(), "bilibiliapp".to_string());
                 log::debug!("buvid3: {}, buvid4: {}, b_nut: {}, fp: {}, _uuid: {}, bili_ticket: {}, bili_ticket_expires: {}", buvid3, buvid4, b_nut, fp, _uuid, bili_ticket, bili_ticket_expires);
 
                 let web_data = WebData {
@@ -288,6 +307,7 @@ impl CookieManager {
                 };
                 Self {
                     client: Arc::new(client),
+                    h2_client: Arc::new(h2_client),
                     create_type: create_type,
                     app_data: None,
                     web_data: Some(web_data),
@@ -300,11 +320,13 @@ impl CookieManager {
             _ => {
                 //默认浏览器
                 log::warn!("创建类型错误");
+                let fallback = Arc::new(reqwest::Client::builder()
+                    .cookie_store(true)
+                    .build()
+                    .unwrap_or_default());
                 Self{
-                    client: Arc::new(reqwest::Client::builder()
-                        .cookie_store(true)
-                        .build()
-                        .unwrap_or_default()),
+                    client: fallback.clone(),
+                    h2_client: fallback,
                     create_type: 0,
                     app_data: None,
                     web_data: None,
@@ -354,7 +376,8 @@ impl CookieManager {
     pub fn from_client(client: Arc<reqwest::Client>, original_cookie : &str) -> Self {
         let cookies = Self::parse_cookie_string(original_cookie);
         Self {
-            client: client,
+            client: client.clone(),
+            h2_client: client,
             create_type: 0,
             app_data: None,
             web_data: None,
@@ -436,6 +459,13 @@ impl CookieManager {
         let builder = self.client.post(url);
         let builder = self.prepare_request_with_overrides(builder, &headers);
         builder
+    }
+
+    /// 与 [`post_with_headers`] 完全相同的 cookie / header 处理逻辑，
+    /// 仅把底层客户端换成 rustls 后端的 `h2_client`（强制走 HTTP/2）。
+    pub async fn post_with_headers_h2(&self, url: &str, headers: HashMap<&str, &str>) -> reqwest::RequestBuilder {
+        let builder = self.h2_client.post(url);
+        self.prepare_request_with_overrides(builder, &headers)
     }
 
     // 处理请求头，允许传入的headers覆盖默认值

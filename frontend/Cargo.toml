@@ -48,3 +48,8 @@ jsonwebtoken = "9"
 common = {path = "../common"}
 backend = {path = "../backend"}
 
+[features]
+default = []
+# 顶层开关：用 `cargo build --release --features tls-impersonate` 启用浏览器 TLS 指纹伪装。
+tls-impersonate = ["common/tls-impersonate", "backend/tls-impersonate"]
+

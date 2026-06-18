@@ -5,9 +5,6 @@ use rand::{Rng, thread_rng};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ============================================================
-// EncodeData: 浏览器/屏幕统计数据，用于计算 CToken 各字段值
-// ============================================================
 pub struct EncodeData {
     pub ua: String,
     pub href: String,
@@ -181,10 +178,12 @@ pub struct CTokenGenerator {
     field:       CTokenField,
     when_gen:    SystemTime,
     last_submit: SystemTime,
+    base_timer:  i32,
 }
 
 impl CTokenGenerator {
     pub fn new(_ticket_collection_t: i64, _time_offset: i64, _stay_time: i32, ua : Option<String>) -> Self {
+        let mut rng = thread_rng();
         let ua = ua.unwrap_or_else(|| "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36".to_string());
         let ecdata = EncodeData::new(
             ua,
@@ -194,40 +193,34 @@ impl CTokenGenerator {
         CTokenGenerator {
             field:       CTokenField::from_encode_data(&ecdata),
             when_gen:    SystemTime::now(),
-            last_submit: SystemTime::UNIX_EPOCH,
+            last_submit: SystemTime::now(),
+            base_timer:  rng.gen_range(10..101),
         }
     }
 
     pub fn generate_ctoken(&mut self, is_create_v2: bool) -> String {
         let mut rng = thread_rng();
+        let elapsed = SystemTime::now()
+            .duration_since(self.when_gen)
+            .unwrap_or_default()
+            .as_secs() as i32;
 
         if is_create_v2 {
-            // createV2 阶段：累积交互次数
-            self.field.f += rng.gen_range(1..4); // 点击继续增加
-            self.field.b += rng.gen_range(1..3); // 页面切换继续增加
-            self.field.v += rng.gen_range(0..2); // openWindow 继续增加
-            self.field.g = SystemTime::now()
-                .duration_since(self.when_gen)
-                .unwrap()
-                .as_secs() as i32
-                + 10; // 页面停留时间
-            self.field.u = SystemTime::now()
-                .duration_since(self.last_submit)
-                .unwrap()
-                .as_secs() as i32; // 距上次提交的间隔
+           self.field.f = rng.gen_range(0..3);   // touchend 点击 0~2
+            self.field.b = rng.gen_range(0..2);   // visibilitychange 0~1
+            self.field.v = rng.gen_range(10..51); // byte6 = beforeunload 10~50（create 阶段的关键差异）
+            self.field.g = self.base_timer + elapsed; // timer = 基线 + 已过秒
+            self.field.u = elapsed;                   // timediff = 距开抢秒数
         } else {
-            self.field.f = rng.gen_range(3..10); // 模拟点击次数
-            self.field.b = rng.gen_range(0..2);  // 模拟页面切换
-            self.field.v = rng.gen_range(0..3);  // 模拟 openWindow 次数
-            self.field.g = SystemTime::now()
-                .duration_since(self.when_gen)
-                .unwrap()
-                .as_secs() as i32; // 页面停留时间
-            self.field.u = 0; // 首次请求，无间隔
+            self.field.f = 0;                     // touchend = 0
+            self.field.b = 0;                     // visibilitychange = 0
+            self.field.v = rng.gen_range(1..4);   // byte6 = openWindow 1~3
+            self.field.g = self.base_timer + elapsed; // timer
+            self.field.u = 0;                     // timediff = 0
         }
 
         self.last_submit = SystemTime::now();
-        log::debug!("生成 CToken，f: {}, b: {}, v: {}, g: {}, u: {}", self.field.f, self.field.b, self.field.v, self.field.g, self.field.u);
+        log::debug!("生成 CToken，f(touch): {}, b(vis): {}, v(byte6): {}, g(timer): {}, u(diff): {}", self.field.f, self.field.b, self.field.v, self.field.g, self.field.u);
         let ctoken = self.field.encode();
         log::debug!("总ctoken: {}", ctoken);
         ctoken

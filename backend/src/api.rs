@@ -322,34 +322,46 @@ pub async fn get_ticket_token(cookie_manager:Arc<CookieManager>,
 
     let params = if is_hot {
         json!({
-            "project_id": project_id,
-            "screen_id": screen_id,
-            "sku_id": ticket_id,
             "count": count,
+            "screen_id": screen_id.parse::<i64>().unwrap_or(0),
             "order_type": 1,
+            "project_id": project_id.parse::<i64>().unwrap_or(0),
+            "sku_id": ticket_id.parse::<i64>().unwrap_or(0),
+            
+            
             "token": cpdd.lock().unwrap().generate_ctoken(false),
+            "newRisk": true,
             "requestSource": "neul-next",
-            "newRisk": "true",
         })
     } else {
         json!({
-            "project_id": project_id,
-            "screen_id": screen_id,
-            "sku_id": ticket_id,
             "count": count,
+            "screen_id": screen_id.parse::<i64>().unwrap_or(0),
             "order_type": 1,
+            "project_id": project_id.parse::<i64>().unwrap_or(0),
+            "sku_id": ticket_id.parse::<i64>().unwrap_or(0),
+            
             "token": "",
+            "newRisk": true,
             "requestSource": "neul-next",
-            "newRisk": "true",
         })
     };
     log::debug!("获取票token参数：{:?}", params);
     let url = format!("https://show.bilibili.com/api/ticket/order/prepare?project_id={}",project_id);
-    let response = cookie_manager
-        .post(&url).await
-        .json(&params)
-        .send()
-        .await;
+    // 热门项目prepare 走 HTTP/2（与 createV2 同一个 h2 客户端），用桌面 Chrome 身份（默认 UA），
+    let response = if is_hot {
+        cookie_manager
+            .post_with_headers_h2(&url, HashMap::new()).await
+            .json(&params)
+            .send()
+            .await
+    } else {
+        cookie_manager
+            .post(&url).await
+            .json(&params)
+            .send()
+            .await
+    };
     match response {
         Ok(resp) => {
             if resp.status().is_success(){
@@ -516,10 +528,12 @@ pub async fn create_order(
     fast_mode: bool,
     screen_size: Option<(u32, u32)> // 可选参数：(宽度,高度)
 ) -> Result<Value, i32> {
+    
+    let ptoken = ptoken.replace('=', "");
     let url = if !is_hot {
         format!("https://show.bilibili.com/api/ticket/order/createV2?project_id={}", project_id)
     }else{
-        format!("https://show.bilibili.com/api/ticket/order/createV2?project_id={}&ptoken={}", project_id,ptoken.clone())
+        format!("https://show.bilibili.com/api/ticket/order/createV2?project_id={}&ptoken={}", project_id, ptoken)
     };
     
     // 选择适当的位置类型
@@ -544,11 +558,11 @@ pub async fn create_order(
     
     // 生成点击位置
     let click_position = random_click_position(
-        position_type, 
+        position_type,
         fast_mode,
         Some(width),
         Some(height)
-    ).await.to_string();
+    ).await;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -593,7 +607,7 @@ pub async fn create_order(
                 json!({
                     "project_id": project_id.parse::<i64>().unwrap_or(0),
                     "screen_id": biliticket.screen_id.parse::<i64>().unwrap_or(0),
-                    "sku_id": ticket_id_int, 
+                    "sku_id": ticket_id_int,
                     "token": token,
                     "ctoken": cpdd.lock().unwrap().generate_ctoken(true),
                     "ptoken":ptoken,
@@ -605,7 +619,7 @@ pub async fn create_order(
                     "pay_money": pay_money,
                     "count": count,
                     "timestamp": timestamp,
-                    "order_type": 1, 
+                    "order_type": 1,
                 })
             }else{
                 json!({
@@ -633,7 +647,7 @@ pub async fn create_order(
     };
 
     log::debug!("抢票data ：{:?}", data);
-    let response = cookie_manager.post_with_headers(&url,input_risk_header).await
+    let response = cookie_manager.post_with_headers_h2(&url, input_risk_header).await
         .json(&data)
         .send()
         .await
@@ -641,6 +655,7 @@ pub async fn create_order(
             log::error!("请求失败: {}", e);
             412
         })?;
+    log::debug!("createV2 实际协议版本: {:?}", response.version());
     if response.status() != 200 {
         log::error!("请求失败: {}", response.status());
         return Err(response.status().as_u16() as i32);

@@ -339,6 +339,41 @@ fn decrypt_data(iv:Vec<u8>,encrypted: &[u8]) -> Result<Vec<u8>, block_modes::Blo
     cipher.decrypt_vec(encrypted)
 }
 
+
+fn buyer_cache_path(uid: i64) -> String {
+    format!("./buyer_cache_{}.dat", uid)
+}
+
+/// 保存某账号的购票人列表到本地（设备码加密）。uid 用于区分不同账号。
+pub fn save_buyer_cache(uid: i64, buyers: &[crate::ticket::BuyerInfo]) -> io::Result<()> {
+    let json_str = serde_json::to_string(buyers)?;
+    let (iv, encrypted) = encrypt_data(json_str.as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let content = format!("{}%{}", BASE64.encode(&iv), BASE64.encode(&encrypted));
+    fs::write(buyer_cache_path(uid), content)?;
+    log::debug!("已缓存账号 {} 的购票人列表（{} 人）", uid, buyers.len());
+    Ok(())
+}
+
+/// 从本地读取某账号缓存的购票人列表（设备码解密）。
+pub fn load_buyer_cache(uid: i64) -> io::Result<Vec<crate::ticket::BuyerInfo>> {
+    let raw = fs::read_to_string(buyer_cache_path(uid))?;
+    let parts = raw.split('%').collect::<Vec<&str>>();
+    if parts.len() != 2 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "购票人缓存格式错误"));
+    }
+    let iv = BASE64.decode(parts[0].trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let encrypted = BASE64.decode(parts[1].trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let decrypted = decrypt_data(iv, &encrypted)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let json_str = String::from_utf8(decrypted)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let buyers = serde_json::from_str(&json_str)?;
+    Ok(buyers)
+}
+
 // 单例锁实现，防止程序多开
 use single_instance::SingleInstance;
 

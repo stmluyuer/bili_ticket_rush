@@ -248,7 +248,7 @@ pub fn push_setting(app: &mut Myapp, ui: &mut egui::Ui){
             //推送设置
             ui.horizontal(|ui|{
                  
-                common_input(ui, "bark推送：",&mut app.push_config.bark_token,"请输入推送地址，只填token",true);
+                common_input(ui, "bark推送：",&mut app.push_config.bark_token,"请输入推送地址，只填token，token后可用?附加参数",false);
                 dynamic_caculate_space(ui, 180.0);
                 common_input(ui, "pushplus推送：",&mut app.push_config.pushplus_token,"请输入推送地址，只填token",true);
                 });

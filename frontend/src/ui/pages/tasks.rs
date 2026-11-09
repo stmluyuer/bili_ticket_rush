@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use common::taskmanager::{GrabPhase, RunningTaskInfo, TaskOutcome, TaskStatus};
+use common::taskmanager::{GrabPhase, OrderState, RunningTaskInfo, TaskOutcome, TaskStatus};
 use eframe::egui::{
     self, pos2, text::LayoutJob, vec2, Align, Align2, Color32, CursorIcon, FontId, Label, Layout,
     Margin, Rect, Response, RichText, Sense, Shape, Stroke, TextFormat, Ui,
@@ -10,6 +10,7 @@ use eframe::egui::{
 use crate::app::{Dialog, Myapp, Page};
 use crate::state::logs::{display_label, Level, LevelFilter, LogLine};
 use crate::state::tasks::{TaskBoard, TasksTab};
+use crate::ui::pages::accounts::open_order_detail;
 use crate::ui::theme::{bold, palette, Palette, Tone};
 use crate::ui::widgets::{self, FieldOpts, Kind, Size};
 
@@ -26,6 +27,10 @@ enum Action {
     ConfirmStop { task_id: String, seq: u64 },
     CancelStop,
     Pay(String),
+    CopyOrder(String),
+    CopyPaymentLink(String),
+    OpenOrder(String),
+    OpenAccountOrders(i64),
     GoNewTask,
 }
 
@@ -63,7 +68,7 @@ pub fn render(app: &mut Myapp, ui: &mut Ui) {
         .inner;
 
     if let Some(action) = action {
-        apply_action(app, action);
+        apply_action(app, ui.ctx(), action);
     }
 }
 
@@ -81,15 +86,15 @@ fn header(app: &mut Myapp, ui: &mut Ui) {
             &[(TasksTab::Running, run_label.as_str()), (TasksTab::Finished, fin_label.as_str())],
         );
         if app.tasks_tab == TasksTab::Finished {
-            let enabled = !app.board.finished.is_empty();
+            let enabled = app.board.finished.iter().any(|finished| finished.info.order.is_none());
             if widgets::button_ex(ui, "清除已结束", Kind::Ghost, Size::Sm, false, enabled).clicked() {
-                app.board.finished.clear();
+                app.board.clear_finished();
             }
         }
     });
 }
 
-fn apply_action(app: &mut Myapp, action: Action) {
+fn apply_action(app: &mut Myapp, ctx: &egui::Context, action: Action) {
     match action {
         Action::OpenLog { seq, account } => {
             app.log_filter.label = Some(format!("#{} {}", seq, account));
@@ -102,7 +107,7 @@ fn apply_action(app: &mut Myapp, action: Action) {
             match app.task_manager.cancel_task(&task_id) {
                 Ok(()) => {
                     log::info!("已请求取消任务: {}", task_id);
-                    app.toasts.neutral(format!("已停止 No.{:04}", seq));
+                    app.toasts.neutral(format!("已请求停止 No.{:04}", seq));
                 }
                 Err(e) => {
                     log::error!("取消任务失败: {}", e);
@@ -117,6 +122,16 @@ fn apply_action(app: &mut Myapp, action: Action) {
                 app.dialog = Dialog::Payment;
             }
         }
+        Action::CopyOrder(order_id) => {
+            widgets::copy_text(ctx, order_id);
+            app.toasts.neutral("已复制订单号");
+        }
+        Action::CopyPaymentLink(code_url) => {
+            widgets::copy_text(ctx, code_url);
+            app.toasts.neutral("已复制支付链接");
+        }
+        Action::OpenOrder(order_id) => open_order_detail(ctx, &order_id),
+        Action::OpenAccountOrders(uid) => app.open_account_orders(uid),
         Action::GoNewTask => app.page = Page::NewTask,
     }
 }
@@ -136,7 +151,7 @@ fn task_list(tab: TasksTab, board: &TaskBoard, ui: &mut Ui, p: &Palette) -> Opti
             }
             for info in &board.running {
                 let confirming = board.stop_confirm.as_ref().map_or(false, |(id, _)| *id == info.task_id);
-                if let Some(a) = ticket_card(ui, p, info, None, confirming, None) {
+                if let Some(a) = ticket_card(ui, p, info, None, confirming, false) {
                     action = Some(a);
                 }
             }
@@ -146,12 +161,11 @@ fn task_list(tab: TasksTab, board: &TaskBoard, ui: &mut Ui, p: &Palette) -> Opti
                 widgets::empty_state(ui, "还没有结束的任务", "本次运行期间结束的任务会显示在这里", None);
             }
             for finished in &board.finished {
-                let amount = board
+                let has_payment_reminder = board
                     .payments
                     .iter()
-                    .find(|pm| pm.task_id == finished.info.task_id)
-                    .map(|pm| pm.amount_fen);
-                if let Some(a) = ticket_card(ui, p, &finished.info, Some(&finished.outcome), false, amount) {
+                    .any(|payment| payment.task_id == finished.info.task_id);
+                if let Some(a) = ticket_card(ui, p, &finished.info, Some(&finished.outcome), false, has_payment_reminder) {
                     action = Some(a);
                 }
             }
@@ -161,20 +175,23 @@ fn task_list(tab: TasksTab, board: &TaskBoard, ui: &mut Ui, p: &Palette) -> Opti
 }
 
 fn is_cancelling(info: &RunningTaskInfo) -> bool {
-    matches!(&info.status, TaskStatus::Failed(msg) if msg == "取消中")
+    matches!(info.status, TaskStatus::Cancelling)
 }
 
 /// 阶段 pill 的语气与文字，左缘竖条同色
 fn stage(info: &RunningTaskInfo, outcome: Option<&TaskOutcome>) -> (Tone, &'static str) {
     match outcome {
-        Some(TaskOutcome::Succeeded) => (Tone::Success, "已抢到"),
+        Some(TaskOutcome::Succeeded) => (Tone::Success, "待支付"),
         Some(TaskOutcome::Stopped) => (Tone::Neutral, "已停止"),
-        Some(TaskOutcome::Ended(_)) => (Tone::Danger, "已结束"),
+        Some(TaskOutcome::AwaitingConfirmation(_)) => (Tone::Warning, "待确认"),
+        Some(TaskOutcome::Ended(_)) => (Tone::Danger, "失败"),
         None if is_cancelling(info) => (Tone::Neutral, "停止中"),
         None => match info.phase {
             GrabPhase::Preparing => (Tone::Neutral, "准备中"),
             GrabPhase::WaitingSale => (Tone::Neutral, "等待开售"),
-            GrabPhase::Grabbing => (Tone::Info, "抢票中"),
+            GrabPhase::Confirming => (Tone::Neutral, "确认参数"),
+            GrabPhase::Grabbing => (Tone::Info, "下单中"),
+            GrabPhase::CheckingOrder => (Tone::Info, "查询订单"),
             GrabPhase::Captcha => (Tone::Warning, "验证码"),
             GrabPhase::Monitoring => (Tone::Info, "监控中"),
         },
@@ -199,14 +216,14 @@ fn ago(at: SystemTime) -> String {
     if secs < 60 { format!("{} 秒前", secs) } else { format!("{} 分钟前", secs / 60) }
 }
 
-/// 左区 + 右存根；amount 为该任务待付款金额（分），只对已抢到的卡有意义
+/// 左区与右侧存根分别显示任务详情和状态。
 fn ticket_card(
     ui: &mut Ui,
     p: &Palette,
     info: &RunningTaskInfo,
     outcome: Option<&TaskOutcome>,
     confirming: bool,
-    amount: Option<i64>,
+    has_payment_reminder: bool,
 ) -> Option<Action> {
     let width = ui.available_width();
     let left_w = (width - STUB_W).max(160.0);
@@ -224,7 +241,7 @@ fn ticket_card(
                 .show(ui, |ui| {
                     ui.set_width(left_w - 34.0);
                     ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-                    card_main(ui, p, info);
+                    action = card_main(ui, p, info, outcome, has_payment_reminder);
                 });
         });
         ui.vertical(|ui| {
@@ -232,7 +249,9 @@ fn ticket_card(
             egui::Frame::none().inner_margin(Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
                 ui.set_width(STUB_W - 28.0);
                 ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
-                action = card_stub(ui, p, info, outcome, confirming, amount, tone, stage_text);
+                if let Some(stub_action) = card_stub(ui, p, info, outcome, confirming, has_payment_reminder, tone, stage_text) {
+                    action = Some(stub_action);
+                }
             });
         });
     });
@@ -252,7 +271,13 @@ fn ticket_card(
     action
 }
 
-fn card_main(ui: &mut Ui, p: &Palette, info: &RunningTaskInfo) {
+fn card_main(
+    ui: &mut Ui,
+    p: &Palette,
+    info: &RunningTaskInfo,
+    outcome: Option<&TaskOutcome>,
+    has_payment_reminder: bool,
+) -> Option<Action> {
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("No.{:04}", info.seq)).font(FontId::monospace(12.0)).color(p.text_3));
         let name_w = (ui.available_width() - 56.0).max(40.0);
@@ -269,14 +294,49 @@ fn card_main(ui: &mut Ui, p: &Palette, info: &RunningTaskInfo) {
     };
     ui.add(Label::new(RichText::new(line2).size(12.0).color(p.text_2)).truncate(true));
 
-    let (line3, color) = match &info.last_event {
-        Some(event) => (
-            format!("{} · {}", event.text, ago(event.at)),
-            if event.is_error { p.danger } else { p.text_2 },
-        ),
-        None => (format!("已运行 {}", mmss(info.elapsed_secs)), p.text_2),
+    let reason = match outcome {
+        Some(TaskOutcome::AwaitingConfirmation(reason)) => Some((reason, p.warning)),
+        Some(TaskOutcome::Ended(reason)) => Some((reason, p.danger)),
+        _ => None,
     };
-    ui.add(Label::new(RichText::new(line3).size(12.0).color(color)).truncate(true));
+    if let Some((reason, color)) = reason {
+        let mut job = LayoutJob::single_section(reason.clone(), TextFormat::simple(FontId::proportional(12.0), color));
+        job.wrap.max_rows = 2;
+        ui.add(Label::new(job).wrap(true)).on_hover_text(reason);
+    } else {
+        let (line3, color) = match &info.last_event {
+            Some(event) => (
+                format!("{} · {}", event.text, ago(event.at)),
+                if event.is_error { p.danger } else { p.text_2 },
+            ),
+            None => (format!("已运行 {}", mmss(info.elapsed_secs)), p.text_2),
+        };
+        ui.add(Label::new(RichText::new(line3).size(12.0).color(color)).truncate(true));
+    }
+
+    let mut action = None;
+    if let (Some(_), Some(order)) = (outcome, &info.order) {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(order_id) = &order.order_id {
+                widgets::small(ui, format!("订单号 {order_id}"), p.text_2);
+                if widgets::button_ex(ui, "复制订单号", Kind::Ghost, Size::Sm, false, true).clicked() {
+                    action = Some(Action::CopyOrder(order_id.clone()));
+                }
+                if widgets::button_ex(ui, "打开订单详情", Kind::Ghost, Size::Sm, false, true).clicked() {
+                    action = Some(Action::OpenOrder(order_id.clone()));
+                }
+            }
+            if widgets::button_ex(ui, "查看原账号订单", Kind::Ghost, Size::Sm, false, true).clicked() {
+                action = Some(Action::OpenAccountOrders(info.uid));
+            }
+            if let OrderState::AwaitingPayment(pay) = &order.state {
+                if !has_payment_reminder && widgets::button_ex(ui, "复制支付链接", Kind::Ghost, Size::Sm, false, true).clicked() {
+                    action = Some(Action::CopyPaymentLink(pay.code_url.clone()));
+                }
+            }
+        });
+    }
+    action
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -286,7 +346,7 @@ fn card_stub(
     info: &RunningTaskInfo,
     outcome: Option<&TaskOutcome>,
     confirming: bool,
-    amount: Option<i64>,
+    has_payment_reminder: bool,
     tone: Tone,
     stage_text: &str,
 ) -> Option<Action> {
@@ -322,7 +382,6 @@ fn card_stub(
         }
     });
 
-    let small_font = FontId::proportional(12.0);
     let metric = |ui: &mut Ui, before: &str, value: String, after: &str, color: Color32| {
         ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -343,6 +402,7 @@ fn card_stub(
     };
 
     match outcome {
+        None if is_cancelling(info) => busy(ui, "正在收尾"),
         None => match info.phase {
             GrabPhase::Preparing => busy(ui, "正在准备"),
             GrabPhase::WaitingSale => {
@@ -357,28 +417,40 @@ fn card_stub(
                     None => metric(ui, "", "--:--:--".into(), "", p.text_3),
                 }
             }
-            GrabPhase::Grabbing => metric(ui, "已尝试", info.attempts.to_string(), "次", p.text),
+            GrabPhase::Confirming => busy(ui, "正在确认订单参数"),
+            GrabPhase::Grabbing => metric(ui, "下单尝试", info.attempts.to_string(), "次", p.text),
+            GrabPhase::CheckingOrder => busy(ui, "正在确认订单结果"),
             GrabPhase::Captcha => busy(ui, "正在处理验证码"),
             GrabPhase::Monitoring => metric(ui, "已检查", info.rounds.to_string(), "轮", p.text),
         },
-        Some(TaskOutcome::Succeeded) => match amount {
-            Some(fen) => {
-                let text = format!("去付款 {}", widgets::money(fen));
-                if widgets::button_ex(ui, &text, Kind::Primary, Size::Xl, false, true).clicked() {
-                    action = Some(Action::Pay(info.task_id.clone()));
+        Some(outcome) => {
+            let ended = matches!(outcome, TaskOutcome::Stopped | TaskOutcome::Ended(_));
+            if matches!(outcome, TaskOutcome::Stopped) {
+                widgets::small(ui, format!("运行 {}", mmss(info.elapsed_secs)), p.text_3);
+            }
+            if let Some(order) = &info.order {
+                match &order.state {
+                    OrderState::PendingConfirmation => {
+                        if ended {
+                            widgets::pill(ui, "待确认", Tone::Warning);
+                        }
+                    }
+                    OrderState::AwaitingPayment(_) => {
+                        if ended {
+                            widgets::pill(ui, "待支付", Tone::Success);
+                        }
+                        let amount = widgets::money(order.confirm.pay_money);
+                        if has_payment_reminder {
+                            let text = format!("去付款 {amount}");
+                            if widgets::button_ex(ui, &text, Kind::Primary, Size::Xl, false, true).clicked() {
+                                action = Some(Action::Pay(info.task_id.clone()));
+                            }
+                        } else {
+                            widgets::small(ui, format!("应付 {amount}"), p.text_2);
+                        }
+                    }
                 }
             }
-            None => {
-                ui.label(RichText::new("下单成功").color(p.success));
-            }
-        },
-        Some(TaskOutcome::Stopped) => {
-            widgets::small(ui, format!("运行 {}", mmss(info.elapsed_secs)), p.text_3);
-        }
-        Some(TaskOutcome::Ended(reason)) => {
-            let mut job = LayoutJob::single_section(reason.clone(), TextFormat::simple(small_font, p.danger));
-            job.wrap.max_rows = 2;
-            ui.add(Label::new(job).wrap(true));
         }
     }
     action

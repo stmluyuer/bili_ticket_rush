@@ -16,6 +16,7 @@ use crate::show_orderlist::OrderResponse;
 pub enum TaskStatus {
     Pending,
     Running,
+    Cancelling,
     Completed(bool),
     Failed(String),
 }
@@ -67,7 +68,6 @@ pub enum TaskResult {
     GetAllorderRequestResult(GetAllorderRequestResult),
     GetTicketInfoResult(GetTicketInfoResult),
     GetBuyerInfoResult(GetBuyerInfoResult),
-    GrabTicketResult(GrabTicketResult),
 }
 //抢票请求
 #[derive(Clone,Debug)]
@@ -98,17 +98,6 @@ pub struct GrabTicketTask {
     pub start_time: Option<Instant>,
     
 
-}
-#[derive(Clone,Debug)]
-pub struct  GrabTicketResult {
-    pub task_id: String,
-    pub uid : i64,
-    pub success: bool,
-    pub message:String,
-    pub order_id: Option<String>,
-    pub pay_token: Option<String>,
-    pub confirm_result: Option<ConfirmTicketResult>,
-    pub pay_result: Option<CheckFakeResultData>,
 }
 //获取购票人信息
 #[derive(Clone,Debug)]
@@ -356,6 +345,8 @@ pub struct RunningTaskInfo {
     pub target: String,
     pub project_id: String,
     pub ticket_id: String,
+    /// 任务取消或异常结束也必须保留已发送订单的事实。
+    pub order: Option<OrderContext>,
 }
 
 /// 抢票任务所处阶段，由后端在关键日志旁上报
@@ -363,7 +354,9 @@ pub struct RunningTaskInfo {
 pub enum GrabPhase {
     Preparing,
     WaitingSale,
+    Confirming,
     Grabbing,
+    CheckingOrder,
     Captcha,
     Monitoring,
 }
@@ -379,7 +372,26 @@ pub struct TaskEvent {
 pub enum TaskOutcome {
     Succeeded,
     Stopped,
+    AwaitingConfirmation(String),
     Ended(String),
+}
+
+/// 执行结果与订单事实分开：停止自动请求并不撤销已受理的订单。
+#[derive(Clone, Debug)]
+pub enum OrderState {
+    PendingConfirmation,
+    AwaitingPayment(CheckFakeResultData),
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderContext {
+    pub order_id: Option<String>,
+    pub query_token: Option<String>,
+    pub project_id: String,
+    pub screen_id: String,
+    pub ticket_id: String,
+    pub confirm: ConfirmTicketResult,
+    pub state: OrderState,
 }
 
 /// 已结束抢票任务的最后快照

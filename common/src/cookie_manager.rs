@@ -122,8 +122,17 @@ impl CookieManager {
                     .cookie_store(true)
                     .user_agent(ua.clone())
                     .use_native_tls()
+                    // 创建订单的重定向不能自动重放 POST；非成功响应交给购票状态机判断。
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
-                    .unwrap_or_else(|_| client.clone());
+                    .unwrap_or_else(|error| {
+                        log::warn!("下单客户端初始化失败，使用默认 UA：{}", error);
+                        reqwest::Client::builder()
+                            .cookie_store(true)
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build()
+                            .expect("初始化下单客户端失败")
+                    });
 
             //ck部分
                 let (buvid3, buvid4, b_nut) = {

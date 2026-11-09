@@ -6,7 +6,7 @@ use bili_ticket_gt::slide::Slide;
 use crate::cookie_manager::CookieManager;
 use crate::{ ticket::TokenRiskParam, utility::CustomConfig};
 
-#[derive(Clone)]  
+#[derive(Clone, Default)]
 pub struct LocalCaptcha{
     click: Arc<Mutex<Option<Click>>>,
     slide: Option<Arc<Mutex<Slide>>>,
@@ -30,8 +30,8 @@ impl fmt::Debug for LocalCaptcha {
 impl LocalCaptcha {
     pub fn new() -> Self {
         // 首次运行会下载模型，改为后台预热，避免阻塞主线程导致界面卡住
-        let click = Arc::new(Mutex::new(None));
-        let click_for_prewarm = Arc::clone(&click);
+        let captcha = Self::default();
+        let click_for_prewarm = Arc::clone(&captcha.click);
         std::thread::spawn(move || {
             match std::panic::catch_unwind(Click::default) {
                 Ok(model) => {
@@ -46,10 +46,7 @@ impl LocalCaptcha {
             }
         });
 
-        LocalCaptcha {
-            click,
-            slide: None, //暂时先不初始化滑块，疑似出现滑块概率极低
-        }
+        captcha
     }
 }
 pub async fn captcha(

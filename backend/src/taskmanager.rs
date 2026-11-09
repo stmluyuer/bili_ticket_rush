@@ -1,25 +1,21 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::record_log::TASK_LABEL;
 
 use common::cookie_manager::CookieManager;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
-use serde_json::json;
-
-
-
-
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use common::taskmanager::{*};
 use common::captcha::handle_risk_verification;
 use common::login::{send_loginsms,sms_login};
-use common::ticket::ConfirmTicketResult;
+use common::push::PushConfig;
 use common::gen_cp::CTokenGenerator;
 use common::ticket::{*};
 use crate::show_orderlist::get_orderlist;
@@ -29,12 +25,41 @@ use crate::api::{*};
 struct GrabTaskEntry {
     info_seed: RunningTaskInfo,
     start_time: std::time::Instant,
-    cancel_flag: Arc<AtomicBool>,
+    cancel: watch::Sender<bool>,
     outcome: Option<TaskOutcome>,
 }
 
+impl GrabTaskEntry {
+    fn new(request: &GrabTicketRequest, seq: u64) -> Self {
+        let project = request.biliticket.project_info.as_ref();
+        Self {
+            info_seed: RunningTaskInfo {
+                task_id: request.task_id.clone(),
+                seq,
+                uid: request.uid,
+                account_name: request.biliticket.account.name.clone(),
+                project_name: project.and_then(|p| p.name.clone()).unwrap_or_else(|| request.project_id.clone()),
+                grab_mode: request.grab_mode,
+                status: TaskStatus::Running,
+                elapsed_secs: 0,
+                phase: GrabPhase::Preparing,
+                sale_at: None,
+                attempts: 0,
+                rounds: 0,
+                last_event: None,
+                target: grab_target(request.grab_mode, project, &request.screen_id, &request.ticket_id, request.count),
+                project_id: request.project_id.clone(),
+                ticket_id: request.ticket_id.clone(),
+                order: None,
+            },
+            start_time: std::time::Instant::now(),
+            cancel: watch::channel(false).0,
+            outcome: None,
+        }
+    }
+}
+
 /// RAII 守卫：任务结束时（正常返回 / return / panic unwind）都会从注册表移除该任务，
-/// 避免 panic 路径下留下永久「运行中」的僵尸条目。用 `if let Ok` 规避锁中毒再次 panic。
 /// 移除时把最后快照转入已结束列表，供界面取走。
 struct GrabRegistryGuard {
     registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>>,
@@ -44,47 +69,36 @@ struct GrabRegistryGuard {
 
 impl Drop for GrabRegistryGuard {
     fn drop(&mut self) {
-        let entry = match self.registry.lock() {
-            Ok(mut registry) => registry.remove(&self.task_id),
-            Err(_) => None,
-        };
+        let entry = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.task_id);
         let Some(entry) = entry else { return };
         let mut info = entry.info_seed;
         info.elapsed_secs = entry.start_time.elapsed().as_secs();
         let outcome = match entry.outcome {
             Some(outcome) => outcome,
-            None if entry.cancel_flag.load(Ordering::Relaxed) => TaskOutcome::Stopped,
-            None => TaskOutcome::Ended(
-                info.last_event
-                    .as_ref()
-                    .map(|e| e.text.clone())
-                    .unwrap_or_else(|| "已结束".to_string()),
-            ),
+            None if *entry.cancel.borrow() => TaskOutcome::Stopped,
+            None if matches!(info.order.as_ref().map(|order| &order.state), Some(OrderState::PendingConfirmation)) => {
+                TaskOutcome::AwaitingConfirmation("购票任务异常结束，请核对订单".to_string())
+            }
+            None => TaskOutcome::Ended("购票任务异常结束".to_string()),
         };
-        if let Ok(mut finished) = self.finished.lock() {
-            finished.push(FinishedTaskInfo {
-                info,
-                outcome,
-                finished_at: SystemTime::now(),
-            });
-        }
+        self.finished.lock().unwrap_or_else(|e| e.into_inner()).push(FinishedTaskInfo {
+            info,
+            outcome,
+            finished_at: SystemTime::now(),
+        });
     }
 }
 
-// 抢票任务内的上报上下文：(注册表, task_id)。handle_grab_ticket / try_create_order
-// 都在该任务的 future 内被 await，因此无需逐层传参。
+// 购票流程在同一任务内运行，进度、发送边界与最终订单共用这一条注册记录。
 tokio::task_local! {
     static GRAB_CTX: (Arc<Mutex<HashMap<String, GrabTaskEntry>>>, String);
 }
 
-/// 修改当前抢票任务的注册表条目；不在抢票任务作用域内时什么也不做
-fn report(f: impl FnOnce(&mut GrabTaskEntry)) {
-    let _ = GRAB_CTX.try_with(|(registry, task_id)| {
+fn report<T>(f: impl FnOnce(&mut GrabTaskEntry) -> T) -> T {
+    GRAB_CTX.with(|(registry, task_id)| {
         let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = registry.get_mut(task_id) {
-            f(entry);
-        }
-    });
+        f(registry.get_mut(task_id).expect("购票任务应已注册"))
+    })
 }
 
 fn event(text: impl Into<String>, is_error: bool) -> TaskEvent {
@@ -99,31 +113,8 @@ fn report_phase(phase: GrabPhase) {
     report(|t| t.info_seed.phase = phase);
 }
 
-/// 下单接口返回错误码：计一次下单，记录事件；fatal 表示该分支会终止任务
-fn report_order_error(text: String, is_error: bool, fatal: bool) {
-    report(|t| {
-        t.info_seed.attempts += 1;
-        if fatal {
-            t.outcome = Some(TaskOutcome::Ended(text.clone()));
-        }
-        t.info_seed.last_event = Some(event(text, is_error));
-    });
-}
-
-/// 各模式“抢票流程结束”时补上结局；成功、致命错误已设过的不覆盖，
-/// 用户取消也会走到这里，留给守卫判为 Stopped
-fn report_flow_end() {
-    report(|t| {
-        if t.outcome.is_none() && !t.cancel_flag.load(Ordering::Relaxed) {
-            let text = t
-                .info_seed
-                .last_event
-                .as_ref()
-                .map(|e| e.text.clone())
-                .unwrap_or_else(|| "抢票流程结束".to_string());
-            t.outcome = Some(TaskOutcome::Ended(text));
-        }
-    });
+fn report_event(text: impl Into<String>, is_error: bool) {
+    report(|t| t.info_seed.last_event = Some(event(text, is_error)));
 }
 
 /// 任务卡片上的“场次 · 票种 × 数量”
@@ -191,7 +182,6 @@ impl TaskManager for TaskManagerImpl {
         let grab_finished: Arc<Mutex<Vec<FinishedTaskInfo>>> = Arc::new(Mutex::new(Vec::new()));
         let grab_finished_worker = grab_finished.clone();
         let grab_registry_worker = grab_registry.clone();
-        let seq_counter_worker = seq_counter.clone();
 
         // 启动工作线程
         let worker = thread::spawn(move || {
@@ -506,666 +496,13 @@ impl TaskManager for TaskManagerImpl {
                                         
                                     });
                                 }
-                                TaskRequest::GrabTicketRequest(grab_ticket_req)=>{
-                                    let project_id = grab_ticket_req.project_id.clone();
-                                    let screen_id = grab_ticket_req.screen_id.clone();
-                                    let ticket_id = grab_ticket_req.ticket_id.clone();
-                                    let buyer_info = grab_ticket_req.buyer_info.clone();
-                                    let cookie_manager = grab_ticket_req.cookie_manager.clone();
-                                    let task_id = grab_ticket_req.task_id.clone();
-                                    let result_tx = result_tx.clone();
-                                    let uid = grab_ticket_req.uid.clone();
-                                    let mode = grab_ticket_req.grab_mode.clone();
-                                    let custon_config = grab_ticket_req.biliticket.config.clone();
-                                    let csrf = grab_ticket_req.biliticket.account.csrf.clone();
-                                    let local_captcha = grab_ticket_req.local_captcha.clone();     
-                                    let count = grab_ticket_req.count.clone();                                                               
-                                    let project_info = grab_ticket_req.biliticket.project_info.clone();                                                                    
-                                    let skip_words= grab_ticket_req.skip_words.clone();
-                                    let mut rng = StdRng::from_entropy();
-                                    let mut is_hot = grab_ticket_req.is_hot.clone();
-                                    let referer_link = grab_ticket_req.biliticket.referer.clone();
-                                    let mut cpdd = if project_info.is_some(){
-                                        Arc::new(Mutex::new(CTokenGenerator::new(
-                                            project_info.clone().unwrap().sale_begin.unwrap_or(
-                                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
-                                            ),
-                                            0,
-                                            rng.gen_range(2000..10000),
-                                            cookie_manager.get_ua().clone(),
-                                            
-                                        )))
-                                    }else{
-                                        Arc::new(Mutex::new(CTokenGenerator::new(
-                                            SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_secs() as i64, 
-                                            0,
-                                            rng.gen_range(2000..10000),
-                                            cookie_manager.get_ua().clone(),
-                                        )))
+                                TaskRequest::GrabTicketRequest(grab_ticket_req) => {
+                                    let guard = GrabRegistryGuard {
+                                        registry: grab_registry_worker.clone(),
+                                        finished: grab_finished_worker.clone(),
+                                        task_id,
                                     };
-                                    // 注册到抢票任务注册表
-                                    let cancel_flag = Arc::new(AtomicBool::new(false));
-                                    let seq = seq_counter_worker.fetch_add(1, Ordering::Relaxed) + 1;
-                                    let project_name_for_entry = project_info.as_ref()
-                                        .and_then(|p| p.name.clone())
-                                        .unwrap_or_else(|| project_id.clone());
-                                    let account_name_for_entry = grab_ticket_req.biliticket.account.name.clone();
-                                    let task_label = format!("#{} {}", seq, account_name_for_entry);
-                                    {
-                                        let entry = GrabTaskEntry {
-                                            info_seed: RunningTaskInfo {
-                                                task_id: task_id.clone(),
-                                                seq,
-                                                uid,
-                                                account_name: account_name_for_entry,
-                                                project_name: project_name_for_entry,
-                                                grab_mode: mode,
-                                                status: TaskStatus::Running,
-                                                elapsed_secs: 0,
-                                                phase: GrabPhase::Preparing,
-                                                sale_at: None,
-                                                attempts: 0,
-                                                rounds: 0,
-                                                last_event: None,
-                                                target: grab_target(mode, project_info.as_ref(), &screen_id, &ticket_id, count),
-                                                project_id: project_id.clone(),
-                                                ticket_id: ticket_id.clone(),
-                                            },
-                                            start_time: std::time::Instant::now(),
-                                            cancel_flag: cancel_flag.clone(),
-                                            outcome: None,
-                                        };
-                                        if let Ok(mut reg) = grab_registry_worker.lock() {
-                                            reg.insert(task_id.clone(), entry);
-                                        }
-                                    }
-                                    let grab_registry_cleanup = grab_registry_worker.clone();
-                                    let grab_finished_cleanup = grab_finished_worker.clone();
-                                    let task_id_cleanup = task_id.clone();
-                                    let grab_ctx = (grab_registry_worker.clone(), task_id.clone());
-                                    tokio::spawn(async move{
-                                    // 守卫在 spawn 内最外层创建，任务以任何方式结束（含 panic）时都会清理注册表
-                                    let _registry_guard = GrabRegistryGuard {
-                                        registry: grab_registry_cleanup,
-                                        finished: grab_finished_cleanup,
-                                        task_id: task_id_cleanup,
-                                    };
-                                    GRAB_CTX.scope(grab_ctx, TASK_LABEL.scope(task_label, async move {
-                                        log::debug!("开始分析抢票任务：{}",task_id);
-                                       
-                                        match mode {
-                                            0 => {
-                                                log::debug!("定时抢票模式");
-                                                //log::debug!("开售时间：{}",project_info.clone().unwrap().sale_begin);
-                                                let sale_begin = project_info.as_ref().and_then(|p| p.sale_begin);
-                                                let mut countdown = match get_countdown(cookie_manager.clone(),project_info).await{
-                                                    Ok(countdown) => countdown,
-                                                    Err(e) => {
-                                                        log::error!("获取倒计时失败: {}", e);
-                                                        return;
-                                                    }
-                                                };
-                                                
-                                                //log::debug!("获取倒计时成功：{}",countdown);
-                                                if countdown > 0.0{
-                                                    log::info!("距离抢票时间还有{}秒",countdown);
-                                                    let sale_at = sale_begin.unwrap_or_else(|| {
-                                                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + countdown as i64
-                                                    });
-                                                    report(|t| {
-                                                        t.info_seed.phase = GrabPhase::WaitingSale;
-                                                        t.info_seed.sale_at = Some(sale_at);
-                                                    });
-                                                    loop{
-                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                        if countdown <= 20.0 {
-                                                            break;
-                                                        }
-                                                        countdown = countdown - 15.0;
-                                                        // 分片 sleep，使取消在约 1 秒内生效
-                                                        for _ in 0..15 {
-                                                            if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                                        }
-                                                        log::info!("距离抢票时间还有{}秒",countdown);
-
-                                                    }
-                                                    loop{
-                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                        if countdown <= 1.3 {  //按道理来说countdown是1秒，为了保险多设置几秒
-                                                            tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.8)).await;
-                                                            break;
-                                                        }
-                                                        log::info!("距离抢票时间还有{}秒",countdown);
-                                                        countdown = countdown - 1.0;
-                                                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                                    }
-                                                }
-                                                log::info!("开始抢票！");
-                                                report_phase(GrabPhase::Grabbing);
-                                                let mut token_retry_count = 0;
-                                                const MAX_TOKEN_RETRY: i8 = 5;
-                                                let mut confirm_order_retry_count = 0;
-                                                const MAX_CONFIRM_ORDER_RETRY: i8 = 4;
-                                                let mut order_retry_count = 0;
-                                                let mut need_retry = false;
-
-                                                //抢票主循环
-                                                loop{
-                                                    if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                    let token_result = get_ticket_token(cookie_manager.clone(), cpdd.clone(),&project_id, &screen_id, &ticket_id, count, is_hot).await;
-                                                    match token_result {
-                                                        Ok((token,ptoken)) => {
-                                                            //获取token成功！
-                                                            log::info!("获取抢票token成功！:{} ptoken:{}",token,ptoken);
-                                                            let mut confirm_retry_count = 0;
-                                                            const MAX_CONFIRM_RETRY: i8 = 4;
-        
-                                                            //尝试下单
-                                                            loop {
-                                                               if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                               let (success, retry_limit) = handle_grab_ticket(
-                                                                cookie_manager.clone(),
-                                                                cpdd.clone(),
-                                                                  &project_id,
-                                                                  &token,
-                                                                  &ptoken,
-                                                                  is_hot.clone(),
-                                                                  &task_id,
-                                                                  uid,
-                                                                  &result_tx,
-                                                                  &grab_ticket_req,
-                                                                  &buyer_info,
-                                                                  &cancel_flag,
-                                                                ).await ;
-                                                                if success && !retry_limit {
-                                                                    log::info!("抢票流程结束，退出定时抢票模式");
-                                                                    report_flow_end();
-                                                                    break; //成功或致命错误，跳出循环
-                                                                }
-            
-                                                            
-                                                            confirm_retry_count += 1;
-                                                            if confirm_retry_count >= MAX_CONFIRM_RETRY {
-                                                                  log::error!("确认订单失败，已达最大重试次数");
-                                                                  let task_result = TaskResult::GrabTicketResult(GrabTicketResult {
-                                                                    task_id: task_id.clone(),
-                                                                    uid,
-                                                                    success: false,
-                                                                    message: "确认订单失败，已达最大重试次数".to_string(),
-                                                                    order_id: None,
-                                                                    pay_token: None,
-                                                                    pay_result: None,
-                                                                    confirm_result: None,
-                                                                    });
-                                                                  let _ = result_tx.send(task_result).await;
-                                                                    break;
-                                                                }
-                                                           }
-        
-                                                        break; // 跳出token获取循环
-                                                        },
-                                                        Err(risk_param) => {
-                                                            //获取token失败！分析原因
-                                                            if risk_param.code == -401 || risk_param.code == 401 {
-                                                                //需要处理验证码
-                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                                log::warn!("需要验证码，开始处理验证码...");
-                                                                report_phase(GrabPhase::Captcha);
-                                                                match handle_risk_verification(
-                                                                    cookie_manager.clone(), 
-                                                                    risk_param,
-                                                                    &custon_config,
-                                                                    &csrf,
-                                                                    local_captcha.clone(),
-                                                                ).await {
-                                                                    Ok(()) => {
-                                                                        //验证码处理成功，继续抢票
-                                                                        log::info!("验证码处理成功！");
-                                                                        report_phase(GrabPhase::Grabbing);
-                                                                    }
-                                                                    Err(e) => {
-                                                                        //验证码失败
-                                                                        log::error!("验证码处理失败: {}", e);
-                                                                        report(|t| t.info_seed.last_event = Some(event(format!("验证码处理失败: {}", e), true)));
-                                                                        token_retry_count +=1;
-                                                                        if token_retry_count >= MAX_TOKEN_RETRY {
-                                                                            let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
-                                                                                task_id: task_id.clone(),
-                                                                                uid,
-                                                                                success: false,
-                                                                                message: format!("验证码处理失败，已达最大重试次数: {}", e),
-                                                                                order_id: None,
-                                                                                pay_token: None,
-                                                                                pay_result: None,
-                                                                                confirm_result: None,
-                                                                            });
-                                                                            let _ = result_tx.send(task_result).await;
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }else{
-                                                             //人为导致无法重试的错误
-                                                             match risk_param.code {
-                                                                100080 | 100082 => {
-                                                                    log::error!("抢票失败，场次/项目/日期选择有误，请重新提交任务");
-                                                                }
-                                                                100039 => {
-                                                                    log::error!("抢票失败，该场次已停售，请重新提交任务");
-                                                                }
-                                                                _ => {
-                                                                    log::error!("抢票失败，未知错误，请重新提交任务");
-                                                                }
-                                                             }
-                                                             token_retry_count +=1;
-                                                             if token_retry_count >= MAX_TOKEN_RETRY {
-                                                                let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
-                                                                    task_id: task_id.clone(),
-                                                                    uid,
-                                                                    success: false,
-                                                                    message: format!("获取token失败，错误代码: {}，错误信息：{}", risk_param.code, risk_param.message),
-                                                                    order_id: None,
-                                                                    pay_token: None,
-                                                                    pay_result: None,
-                                                                    confirm_result: None,
-                                                                });
-                                                                let _ = result_tx.send(task_result).await;
-                                                                break;
-                                                             }
-                                                    }
-                                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                                                        }
-                                                }
-
-                                                }
-
-                                                
-                                            } 
-                                            1 => {
-                                                log::debug!("直接抢票模式");
-                                                report_phase(GrabPhase::Grabbing);
-                                                let mut token_retry_count = 0;
-                                                const MAX_TOKEN_RETRY: i8 = 10;
-                                                let mut confirm_order_retry_count = 0;
-                                                const MAX_CONFIRM_ORDER_RETRY: i8 = 4;
-                                                let mut order_retry_count = 0;
-                                                let mut need_retry = false;
-
-
-                                                //抢票主循环
-                                                loop{
-                                                    if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                    let token_result = get_ticket_token(cookie_manager.clone(), cpdd.clone(),&project_id, &screen_id, &ticket_id, count, is_hot).await;
-                                                    match token_result {
-                                                        Ok((token,ptoken)) => {
-                                                            //获取token成功！
-                                                            log::info!("获取抢票token成功！:{} ptoken:{}",token,ptoken);
-                                                            let mut confirm_retry_count = 0;
-                                                            const MAX_CONFIRM_RETRY: i8 = 4;
-        
-                                                            //尝试下单
-                                                            loop {
-                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                                let (success, retry_limit) = handle_grab_ticket(
-                                                                 cookie_manager.clone(),
-                                                                 cpdd.clone(),
-                                                                   &project_id,
-                                                                   &token,
-                                                                   &ptoken,
-                                                                   is_hot.clone(),
-                                                                   &task_id,
-                                                                   uid,
-                                                                   &result_tx,
-                                                                   &grab_ticket_req,
-                                                                   &buyer_info,
-                                                                   &cancel_flag,
-                                                                 ).await ;
-                                                                if success {
-                                                                    log::info!("抢票流程结束，退出捡漏模式");
-                                                                    report_flow_end();
-                                                                    
-                                                                    break; //成功或致命错误，跳出循环
-                                                                }
-            
-                                                            
-                                                            confirm_retry_count += 1;
-                                                            if confirm_retry_count >= MAX_CONFIRM_RETRY {
-                                                                  log::error!("确认订单失败，已达最大重试次数");
-                                                                  let task_result = TaskResult::GrabTicketResult(GrabTicketResult {
-                                                                    task_id: task_id.clone(),
-                                                                    uid,
-                                                                    success: false,
-                                                                    message: "确认订单失败，已达最大重试次数".to_string(),
-                                                                    order_id: None,
-                                                                    pay_token: None,
-                                                                    pay_result: None,
-                                                                    confirm_result: None,
-                                                                    });
-                                                                  let _ = result_tx.send(task_result).await;
-                                                                    break;
-                                                                }
-                                                           }
-        
-                                                        break; // 跳出token获取循环
-                                                        },
-                                                        Err(risk_param) => {
-                                                            //获取token失败！分析原因
-                                                            if risk_param.code == -401 || risk_param.code == 401 {
-                                                                //需要处理验证码
-                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                                log::warn!("需要验证码，开始处理验证码...");
-                                                                report_phase(GrabPhase::Captcha);
-                                                                match handle_risk_verification(
-                                                                    cookie_manager.clone(), 
-                                                                    risk_param,
-                                                                    &custon_config,
-                                                                    &csrf,
-                                                                    local_captcha.clone(),
-                                                                ).await {
-                                                                    Ok(()) => {
-                                                                        //验证码处理成功，继续抢票
-                                                                        log::info!("验证码处理成功！");
-                                                                        report_phase(GrabPhase::Grabbing);
-                                                                    }
-                                                                    Err(e) => {
-                                                                        //验证码失败
-                                                                        log::error!("验证码处理失败: {}", e);
-                                                                        report(|t| t.info_seed.last_event = Some(event(format!("验证码处理失败: {}", e), true)));
-                                                                        token_retry_count +=1;
-                                                                        if token_retry_count >= MAX_TOKEN_RETRY {
-                                                                            let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
-                                                                                task_id: task_id.clone(),
-                                                                                uid,
-                                                                                success: false,
-                                                                                message: format!("验证码处理失败，已达最大重试次数: {}", e),
-                                                                                order_id: None,
-                                                                                pay_token: None,
-                                                                                pay_result: None,
-                                                                                confirm_result: None,
-                                                                            });
-                                                                            let _ = result_tx.send(task_result).await;
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }else{
-                                                             //人为导致无法重试的错误
-                                                             match risk_param.code {
-                                                                100080 | 100082 => {
-                                                                    log::error!("抢票失败，场次/项目/日期选择有误，请重新提交任务");
-                                                                }
-                                                                100039 => {
-                                                                    log::error!("抢票失败，该场次已停售，请重新提交任务");
-                                                                }
-                                                                _ => {
-                                                                    log::error!("抢票失败，未知错误，请重新提交任务");
-                                                                }
-                                                             }
-                                                             token_retry_count +=1;
-                                                             if token_retry_count >= MAX_TOKEN_RETRY {
-                                                                let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
-                                                                    task_id: task_id.clone(),
-                                                                    uid,
-                                                                    success: false,
-                                                                    message: format!("获取token失败，错误代码: {}，错误信息：{}", risk_param.code, risk_param.message),
-                                                                    order_id: None,
-                                                                    pay_token: None,
-                                                                    pay_result: None,
-                                                                    confirm_result: None,
-                                                                });
-                                                                let _ = result_tx.send(task_result).await;
-                                                                break;
-                                                             }
-                                                    }
-                                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                                                        }
-                                                }
-
-                                                }
-                                            }
-                                            2=> {
-                                                log::debug!("捡漏模式");
-                                                let mut local_grab_request = grab_ticket_req.clone();
-                                                let mut token_retry_count = 0;
-                                                const MAX_TOKEN_RETRY: i8 = 5;
-                                                // 外层循环，一旦抢票成功或遇到致命错误就退出
-                                                'main_loop: loop {
-                                                    if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                    log::debug!("project_id: {}, screen_id: {}, ticket_id: {}", project_id, screen_id, ticket_id);
-                                                    
-                                                    // 获取项目数据
-                                                    let project_data = match get_project(cookie_manager.clone(), project_id.clone().as_str(), &referer_link).await {
-                                                        Ok(data) => data,
-                                                        Err(e) => {
-                                                            log::error!("获取项目数据失败，原因：{}", e);
-                                                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                                            continue;
-                                                        }
-                                                    };
-                                                    is_hot = project_data.data.hot_project.unwrap_or(false);
-                                                    
-                                                    // 检查项目是否可售
-                                                    /* if ![8,2].contains(&project_data.data.sale_flag_number){
-                                                        log::error!("当前项目已停售，暂时不会放出回流票，请等等重新提交任务");
-                                                        break 'main_loop; // 直接退出整个捡漏模式
-                                                    } */
-                                                    
-                                                    if ![1, 2].contains(&project_data.data.id_bind.unwrap_or(0)) {
-                                                        log::error!("暂不支持抢非实名票捡漏模式");
-                                                        break 'main_loop; 
-                                                    } 
-                                                    local_grab_request.biliticket.id_bind = project_data.data.id_bind.unwrap_or(0);
-                                                    'screen_loop: for screen_data in project_data.data.screen_list {
-                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                        if !screen_data.clickable {
-                                                            continue; 
-                                                        }
-                                                        
-                                                        local_grab_request.screen_id = screen_data.id.unwrap_or(0).to_string();
-                                                        local_grab_request.biliticket.screen_id = screen_data.id.unwrap_or(0).to_string();
-                                                        log::info!("当前项目有可抢票场次，开始抢票！");
-                                                        
-                                                        // 遍历票种
-                                                        'ticket_loop: for ticket_data in screen_data.ticket_list {
-                                                            if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                            if !ticket_data.clickable.unwrap_or(false) {
-                                                                continue; // 跳过不可点击的票种
-                                                            }
-                                                            if let Some(skip_words) = skip_words.clone() {
-                                                                // 检查标题是否包含需要过滤的关键词
-                                                                let title = ticket_data.screen_name.clone().unwrap_or_default().to_lowercase();
-                                                                if skip_words.iter().any(|word| title.contains(&word.to_lowercase())) {
-                                                                    log::info!("跳过包含过滤关键词的场次: {}", ticket_data.screen_name.as_deref().unwrap_or("未知场次"));
-                                                                    continue; // 跳过这个场次
-                                                                }
-                                                                let ticket_title = ticket_data.desc.clone().unwrap_or_default().to_lowercase();
-                                                                if skip_words.iter().any(|word| ticket_title.contains(&word.to_lowercase())) {
-                                                                    log::info!("跳过包含过滤关键词的票种: {}", ticket_data.screen_name.as_deref().unwrap_or("未知票种"));
-                                                                    continue; // 跳过这个票种
-                                                                }
-                                                            }
-                                                            
-                                                            log::info!("当前{} {}票种可售，开始抢票！", ticket_data.screen_name.as_deref().unwrap_or("未知场次"), ticket_data.desc.as_deref().unwrap_or("未知票种"));
-                                                            // 场次级日志每轮都会对可点场次触发（票种可能已售罄），只在票种级上报
-                                                            report(|t| {
-                                                                t.info_seed.phase = GrabPhase::Grabbing;
-                                                                t.info_seed.last_event = Some(event(
-                                                                    format!(
-                                                                        "发现余票：{} {}",
-                                                                        ticket_data.screen_name.as_deref().unwrap_or("未知场次"),
-                                                                        ticket_data.desc.as_deref().unwrap_or("未知票种")
-                                                                    ),
-                                                                    false,
-                                                                ));
-                                                            });
-                                                            local_grab_request.ticket_id = ticket_data.id.unwrap_or(0).to_string();
-                                                            local_grab_request.biliticket.select_ticket_id = Some(ticket_data.id.unwrap_or(0).to_string());
-                                                            cpdd = Arc::new(Mutex::new(CTokenGenerator::new(
-                                                                project_data.data.sale_begin.unwrap_or(
-                                                                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
-                                                                ), 
-                                                                0, 
-                                                                rng.gen_range(2000..10000),
-                                                                cookie_manager.get_ua().clone(),
-                                                            )));
-                                                            // 获取token
-                                                            let token_result = get_ticket_token(
-                                                                cookie_manager.clone(), 
-                                                                cpdd.clone(),
-                                                                &project_id, 
-
-                                                                &local_grab_request.screen_id, 
-                                                                &local_grab_request.ticket_id, 
-                                                                count,
-                                                                is_hot.clone()
-                                                            ).await;
-                                                            match token_result {
-                                                                Ok((token,ptoken)) => {
-                                                                    //获取token成功！
-                                                                    log::info!("获取抢票token成功！:{} ptoken:{}",token,ptoken);
-                                                                    let mut confirm_retry_count = 0;
-                                                                    const MAX_CONFIRM_RETRY: i8 = 4;
-                                                            
-                                                                    loop {
-                                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                                        let (success, retry_limit) = handle_grab_ticket(
-                                                                         cookie_manager.clone(),
-                                                                         cpdd.clone(),
-                                                                           &project_id,
-                                                                           &token,
-                                                                           &ptoken,
-                                                                           is_hot.clone(),
-                                                                           &task_id,
-                                                                           uid,
-                                                                           &result_tx,
-                                                                           &local_grab_request,
-                                                                           &buyer_info,
-                                                                           &cancel_flag,
-                                                                         ).await ;
-                                                                if success {
-                                                                    log::info!("抢票流程结束，退出捡漏模式");
-                                                                    report_flow_end();
-                                                                    
-                                                                    break 'main_loop;
-                                                                }
-                                                                if retry_limit {
-                                                                    log::info!("该票种已达到最大重试次数，恢复捡漏模式，尝试其他票种");
-                                                                    report_phase(GrabPhase::Monitoring);
-                                                                    break 'screen_loop;
-                                                                }
-                                                                
-                                                                confirm_retry_count += 1;
-                                                                if confirm_retry_count >= MAX_CONFIRM_RETRY {
-                                                                    log::error!("确认订单失败，已达最大重试次数，尝试其他票种");
-                                                                    break; // 只跳出当前票种的重试循环
-                                                                }
-                                                                
-                                                                tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.3)).await;
-                                                            }
-                                                        },
-                                                        Err(risk_param) => {
-                                                            //获取token失败！分析原因
-                                                            if risk_param.code == -401 || risk_param.code == 401 {
-                                                                //需要处理验证码
-                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
-                                                                log::warn!("需要验证码，开始处理验证码...");
-                                                                report_phase(GrabPhase::Captcha);
-                                                                match handle_risk_verification(
-                                                                    cookie_manager.clone(), 
-                                                                    risk_param,
-                                                                    &custon_config,
-                                                                    &csrf,
-                                                                    local_captcha.clone(),
-                                                                ).await {
-                                                                    Ok(()) => {
-                                                                        //验证码处理成功，继续抢票
-                                                                        log::info!("验证码处理成功！");
-                                                                        report_phase(GrabPhase::Monitoring);
-                                                                    }
-                                                                    Err(e) => {
-                                                                        //验证码失败
-                                                                        log::error!("验证码处理失败: {}", e);
-                                                                        report(|t| t.info_seed.last_event = Some(event(format!("验证码处理失败: {}", e), true)));
-                                                                        token_retry_count +=1;
-                                                                        if token_retry_count >= MAX_TOKEN_RETRY {
-                                                                            let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
-                                                                                task_id: task_id.clone(),
-                                                                                uid,
-                                                                                success: false,
-                                                                                message: format!("验证码处理失败，已达最大重试次数: {}", e),
-                                                                                order_id: None,
-                                                                                pay_token: None,
-                                                                                pay_result: None,
-                                                                                confirm_result: None,
-                                                                            });
-                                                                            let _ = result_tx.send(task_result).await;
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }else{
-                                                             //人为导致无法重试的错误
-                                                             match risk_param.code {
-                                                                100080 | 100082 => {
-                                                                    log::error!("抢票失败，场次/项目/日期选择有误，请重新提交任务");
-                                                                }
-                                                                100039 => {
-                                                                    log::error!("抢票失败，该场次已停售，请重新提交任务");
-                                                                }
-                                                                _ => {
-                                                                    log::error!("抢票失败，未知错误，请重新提交任务");
-                                                                }
-                                                             }
-                                                             token_retry_count +=1;
-                                                             if token_retry_count >= MAX_TOKEN_RETRY {
-                                                                let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
-                                                                    task_id: task_id.clone(),
-                                                                    uid,
-                                                                    success: false,
-                                                                    message: format!("获取token失败，错误代码: {}，错误信息：{}", risk_param.code, risk_param.message),
-                                                                    order_id: None,
-                                                                    pay_token: None,
-                                                                    pay_result: None,
-                                                                    confirm_result: None,
-                                                                });
-                                                                let _ = result_tx.send(task_result).await;
-                                                                break;
-                                                             }
-                                                    }
-                                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-                                                        }
-                                                
-                                                    }
-                                                        }
-                                                    }
-                                                    
-                                                    // 本轮所有场次和票种都检查完毕，休息一秒后继续下一轮
-                                                    log::info!("所有场次和票种检查完毕，等待2秒后重新检查");
-                                                    report(|t| {
-                                                        t.info_seed.phase = GrabPhase::Monitoring;
-                                                        t.info_seed.rounds += 1;
-                                                        let rounds = t.info_seed.rounds;
-                                                        t.info_seed.last_event = Some(event(format!("第 {} 轮检查完毕，暂无余票", rounds), false));
-                                                    });
-                                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                                }
-                                                
-                                                log::info!("捡漏模式任务已退出");
-                                            }
-                                            _=> {
-                                                log::error!("未知模式");
-                                            }
-                                        }
-                                    })).await; // GRAB_CTX / TASK_LABEL.scope end
-                                    // 任务结束后由 _registry_guard 的 Drop 自动从注册表移除
-                                    });
+                                    tokio::spawn(run_registered_grab_task(guard, grab_ticket_req));
                                 }
                             }
                         },
@@ -1305,14 +642,20 @@ impl TaskManager for TaskManagerImpl {
             }
             TaskRequest::GrabTicketRequest(ref mut grab_ticket_req) => {
                 log::info!("提交抢票任务 ID: {}", task_id);
-                // 将生成的 task_id 注入请求，worker 线程将使用它作为注册表主键
                 grab_ticket_req.task_id = task_id.clone();
+                // 提交返回前即可取消，worker 订阅时也能看到已提交的取消请求。
+                let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                self.grab_registry.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    task_id.clone(),
+                    GrabTaskEntry::new(grab_ticket_req, seq),
+                );
             }
 
         }
         
         // 发送任务
         if let Err(e) = self.task_sender.blocking_send(TaskMessage::SubmitTask((task_id.clone(), request))) {
+            self.grab_registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&task_id);
             return Err(format!("无法提交任务: {}", e));
         }
         
@@ -1345,7 +688,7 @@ impl TaskManager for TaskManagerImpl {
             .unwrap_or_else(|e| e.into_inner());
         match registry.get(task_id) {
             Some(entry) => {
-                entry.cancel_flag.store(true, Ordering::Relaxed);
+                entry.cancel.send_replace(true);
                 Ok(())
             }
             None => Err("任务不存在".to_string()),
@@ -1359,8 +702,8 @@ impl TaskManager for TaskManagerImpl {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         registry.get(task_id).map(|entry| {
-            if entry.cancel_flag.load(Ordering::Relaxed) {
-                TaskStatus::Failed("取消中".to_string())
+            if *entry.cancel.borrow() {
+                TaskStatus::Cancelling
             } else {
                 TaskStatus::Running
             }
@@ -1377,8 +720,8 @@ impl TaskManager for TaskManagerImpl {
             .map(|entry| {
                 let mut info = entry.info_seed.clone();
                 info.elapsed_secs = entry.start_time.elapsed().as_secs();
-                if entry.cancel_flag.load(Ordering::Relaxed) {
-                    info.status = TaskStatus::Failed("取消中".to_string());
+                if *entry.cancel.borrow() {
+                    info.status = TaskStatus::Cancelling;
                 }
                 info
             })
@@ -1403,285 +746,1173 @@ impl TaskManager for TaskManagerImpl {
     }
 }
 
+const CREATE_INTERVAL: Duration = Duration::from_millis(400);
+const PREPARE_INTERVAL: Duration = Duration::from_secs(1);
+const CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
+const ORDER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TOKEN_REFRESHES: u8 = 5;
+const MAX_CONFIRM_ATTEMPTS: u8 = 4;
+const MAX_ORDER_CHECKS: u32 = 30;
 
+enum TargetExit {
+    NextTarget(String),
+    Finished(TaskOutcome),
+}
 
-async fn handle_grab_ticket(
-    cookie_manager: Arc<CookieManager>,
-    cpdd: Arc<Mutex<CTokenGenerator>>,
-    project_id: &str,
-    token: &str,
-    ptoken: &str,
-    is_hot: bool,
-    task_id: &str,
-    uid: i64,
-    result_tx: &mpsc::Sender<TaskResult>,
-    grab_ticket_req: &GrabTicketRequest,
-    buyer_info: &Vec<BuyerInfo>,
-    cancel_flag: &Arc<AtomicBool>,
-) -> (bool, bool) {
-    // 确认订单
-    match confirm_ticket_order(cookie_manager.clone(), project_id, token).await {
-        Ok(confirm_result) => {
-            log::info!("确认订单成功！准备下单");
-            
-            
-            if let Some((success,retry_limit)) = try_create_order(
-                cookie_manager.clone(),
-                cpdd.clone(),
-                project_id,
-                token,
-                ptoken,
-                &confirm_result,
-                is_hot.clone(),
-                grab_ticket_req,
-                buyer_info,
-                task_id,
-                uid,
-                result_tx,
-                cancel_flag,
-            ).await {
-                
-                return (success,retry_limit);
-            }
-            
-            (true, false) // 订单流程已完成
+enum PreparedExit {
+    RefreshToken { reason: String, delay: Duration },
+    Target(TargetExit),
+}
+
+enum BusinessRejection {
+    Retry(Duration),
+    RefreshToken,
+    Target,
+    Task,
+}
+
+fn business_rejection(code: i64) -> Option<BusinessRejection> {
+    Some(match code {
+        100001 | 429 | 900001 => BusinessRejection::Retry(Duration::from_millis(300)),
+        100009 => BusinessRejection::Retry(Duration::from_millis(600)),
+        211 => BusinessRejection::Retry(Duration::ZERO),
+        3 => BusinessRejection::Retry(Duration::from_millis(4800)),
+        100041 | 100050 | 900002 => BusinessRejection::RefreshToken,
+        100016 | 100017 | 100039 | 100080 | 100082 => BusinessRejection::Target,
+        1 | 83000004 | 100079 | 100003 | 209001 | 919 | 999 => BusinessRejection::Task,
+        _ => return None,
+    })
+}
+
+async fn while_running<T>(
+    cancel: &mut watch::Receiver<bool>,
+    action: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|stopped| *stopped) => None,
+        result = action => Some(result),
+    }
+}
+
+async fn wait_running(cancel: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    while_running(cancel, tokio::time::sleep(delay)).await.is_some()
+}
+
+async fn run_registered_grab_task(guard: GrabRegistryGuard, mut request: GrabTicketRequest) {
+    let (task_label, mut cancel) = {
+        let registry = guard.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &registry[&guard.task_id];
+        (
+            format!("#{} {}", entry.info_seed.seq, entry.info_seed.account_name),
+            entry.cancel.subscribe(),
+        )
+    };
+    let grab_ctx = (guard.registry.clone(), guard.task_id.clone());
+    let push_config = request.biliticket.push_self.clone();
+    let notification = GRAB_CTX
+        .scope(grab_ctx, TASK_LABEL.scope(task_label, async {
+            let outcome = run_grab(&mut request, &mut cancel).await;
+            report(|entry| {
+                entry.outcome = Some(outcome);
+                if !push_config.enabled {
+                    return None;
+                }
+                let order = entry.info_seed.order.as_ref()?;
+                let OrderState::AwaitingPayment(payment) = &order.state else { return None };
+                Some(PaymentNotice::new(order, payment))
+            })
+        }))
+        .await;
+
+    drop(guard);
+    if let Some(notification) = notification {
+        #[cfg(test)]
+        tests::observe_notice(&notification);
+        tokio::spawn(notification.push(push_config));
+    }
+}
+
+struct PaymentNotice {
+    title: String,
+    message: String,
+    jump_url: Option<String>,
+}
+
+impl PaymentNotice {
+    fn new(order: &OrderContext, payment: &CheckFakeResultData) -> Self {
+        let confirm = &order.confirm;
+        let amount = format!("{}.{:02}", confirm.pay_money / 100, confirm.pay_money % 100);
+        Self {
+            title: format!("恭喜{}抢票成功！", confirm.project_name),
+            message: format!(
+                "抢票成功！\n项目：{}\n场次：{}\n票种：{}\n支付链接：{}\n请尽快支付{}元",
+                confirm.project_name, confirm.screen_name, confirm.ticket_info.name, payment.code_url, amount,
+            ),
+            jump_url: order.order_id.as_ref().map(|id| {
+                format!("bilibili://mall/web?url=https://mall.bilibili.com/neul-next/ticket/orderDetail.html?order_id={id}")
+            }),
         }
-        Err(e) => {
-            log::error!("确认订单失败，原因：{}  正在重试...", e);
-            (false, false) // 需要继续重试
+    }
+
+    async fn push(self, config: PushConfig) {
+        let (success, _) = config.push_all_async(&self.title, &self.message, &self.jump_url).await;
+        if !success {
+            log::warn!("购票通知发送失败");
         }
     }
 }
 
-// 处理创建订单逻辑
-async fn try_create_order(
-    cookie_manager: Arc<CookieManager>,
-    cpdd: Arc<Mutex<CTokenGenerator>>,
-    project_id: &str,
-    token: &str,
-    ptoken: &str,
-    confirm_result: &ConfirmTicketResult,
-    is_hot: bool,
-    grab_ticket_req: &GrabTicketRequest,
-    buyer_info: &Vec<BuyerInfo>,
-    task_id: &str,
-    uid: i64,
-    result_tx: &mpsc::Sender<TaskResult>,
-    cancel_flag: &Arc<AtomicBool>,
-) -> Option<(
-    bool,
-    bool  // 第二个参数标记是因为达到重试上限
-    )> {
-    let mut order_retry_count = 0;
-    let mut need_retry = false;
-    
-    // 下单循环
+async fn run_grab(request: &mut GrabTicketRequest, cancel: &mut watch::Receiver<bool>) -> TaskOutcome {
+    if *cancel.borrow() {
+        return TaskOutcome::Stopped;
+    }
+    if request.uid != request.biliticket.uid || request.uid != request.biliticket.account.uid {
+        return TaskOutcome::Ended("购票请求的账号与提交快照不符".to_string());
+    }
+    match request.grab_mode {
+        0 | 1 => {
+            let target = match select_target(request) {
+                Ok(target) => target,
+                Err(error) => return TaskOutcome::Ended(error.to_string()),
+            };
+            let sale_begin = request.biliticket.project_info.as_ref().and_then(|project| project.sale_begin);
+            let cpdd = token_generator(&request.cookie_manager, sale_begin);
+            if request.grab_mode == 0 {
+                if let Err(outcome) = wait_for_sale(request, cancel).await {
+                    return outcome;
+                }
+            }
+            let prepare_limit = if request.grab_mode == 0 { 5 } else { 10 };
+            match purchase_target(request, &target, cpdd, prepare_limit, 60, cancel).await {
+                TargetExit::NextTarget(reason) => TaskOutcome::Ended(reason),
+                TargetExit::Finished(outcome) => outcome,
+            }
+        }
+        2 => monitor_targets(request, cancel).await,
+        _ => TaskOutcome::Ended("未知购票模式".to_string()),
+    }
+}
+
+fn select_target(request: &mut GrabTicketRequest) -> Result<PurchaseTarget, PurchaseApiError> {
+    let target = PurchaseTarget::new(&request.project_id, &request.screen_id, &request.ticket_id, request.count)?;
+    let ticket = &mut request.biliticket;
+    ticket.project_id.clone_from(&request.project_id);
+    ticket.screen_id.clone_from(&request.screen_id);
+    ticket.select_ticket_id = Some(request.ticket_id.clone());
+    ticket.count = Some(target.count);
+    Ok(target)
+}
+
+fn token_generator(cookie_manager: &CookieManager, sale_begin: Option<i64>) -> Arc<Mutex<CTokenGenerator>> {
+    Arc::new(Mutex::new(CTokenGenerator::new(
+        sale_begin.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        0,
+        StdRng::from_entropy().gen_range(2000..10000),
+        cookie_manager.get_ua(),
+    )))
+}
+
+async fn wait_for_sale(request: &GrabTicketRequest, cancel: &mut watch::Receiver<bool>) -> Result<(), TaskOutcome> {
+    let info = &request.biliticket.project_info;
+    let countdown = get_countdown(request.cookie_manager.clone(), info.clone());
+    let mut countdown = match while_running(cancel, countdown).await {
+        Some(Ok(seconds)) => seconds,
+        Some(Err(error)) => return Err(TaskOutcome::Ended(format!("获取倒计时失败：{error}"))),
+        None => return Err(TaskOutcome::Stopped),
+    };
+    if countdown <= 0.0 {
+        return Ok(());
+    }
+    report(|entry| {
+        entry.info_seed.phase = GrabPhase::WaitingSale;
+        entry.info_seed.sale_at = info.as_ref().and_then(|project| project.sale_begin);
+    });
+    while countdown > 20.0 {
+        if !wait_running(cancel, Duration::from_secs(15)).await {
+            return Err(TaskOutcome::Stopped);
+        }
+        countdown -= 15.0;
+    }
+    while countdown > 1.3 {
+        if !wait_running(cancel, Duration::from_secs(1)).await {
+            return Err(TaskOutcome::Stopped);
+        }
+        countdown -= 1.0;
+    }
+    if !wait_running(cancel, Duration::from_millis(800)).await {
+        return Err(TaskOutcome::Stopped);
+    }
+    Ok(())
+}
+
+async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Receiver<bool>) -> TaskOutcome {
+    // 捡漏提交时尚无场次或票档，先核对整个任务共用的参数。
+    if request.count <= 0 {
+        return TaskOutcome::Ended("购票数量必须大于 0".to_string());
+    }
+    if !request.project_id.parse::<i64>().is_ok_and(|id| id > 0) {
+        return TaskOutcome::Ended("项目 ID 无效".to_string());
+    }
     loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            log::info!("下单任务已取消");
-            return Some((true,false));
-        }
-        if order_retry_count >= 3 {
-            need_retry = true;
-        }
-        
-        match create_order(
-            cookie_manager.clone(), 
-            cpdd.clone(),
-            project_id, 
-            token,
-            ptoken,
-            confirm_result,
-            is_hot.clone(),
-            &grab_ticket_req.biliticket,
-            buyer_info,
-            true,
-            need_retry,
-            false,
-            None
-        ).await {
-            Ok(order_result) => {
-                log::info!("下单成功！订单信息{:?}", order_result);
-                report(|t| t.info_seed.attempts += 1);
-                let empty_json = json!({});
-                let order_data = order_result.get("data").unwrap_or(&empty_json);
-                
-                let zero_json = json!(0);
-                let order_id = order_data.get("orderId").unwrap_or(&zero_json).as_i64().unwrap_or(0);
-                
-                let empty_string_json = json!("");
-                let pay_token = order_data.get("token").unwrap_or(&empty_string_json).as_str().unwrap_or("");
-                
-                log::info!("下单成功！正在检测是否假票！");
-                // 检测假票
-                let check_result = match check_fake_ticket(cookie_manager.clone(), project_id, pay_token, order_id).await{
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::error!("检测假票失败，原因：{}，请前往订单列表查看是否下单成功", e);
-                        continue; // 继续重试
-                    }
-                };
-                let errno = check_result.get("errno").unwrap_or(&zero_json).as_i64().unwrap_or(0);
-                if errno != 0 {
-                    log::error!("假票，继续抢票");
+        report_phase(GrabPhase::Monitoring);
+        let project = get_project(
+            request.cookie_manager.clone(), &request.project_id, &request.biliticket.referer,
+        );
+        let project = match while_running(cancel, project).await {
+            Some(Ok(project)) => project.data,
+            Some(Err(error)) => {
+                report_event(format!("获取项目数据失败：{error}"), true);
+                if !wait_running(cancel, Duration::from_secs(2)).await {
+                    return TaskOutcome::Stopped;
+                }
+                continue;
+            }
+            None => return TaskOutcome::Stopped,
+        };
+
+        let Some(id_bind @ (1 | 2)) = project.id_bind else {
+            return TaskOutcome::Ended("暂不支持非实名票捡漏".to_string());
+        };
+        request.biliticket.id_bind = id_bind;
+        request.is_hot = project.hot_project.unwrap_or(false);
+        for screen in project.screen_list.into_iter().filter(|screen| screen.clickable) {
+            let Some(screen_id) = screen.id else { continue };
+            for ticket in screen.ticket_list.into_iter().filter(|ticket| ticket.clickable == Some(true)) {
+                if *cancel.borrow() {
+                    return TaskOutcome::Stopped;
+                }
+                let Some(ticket_id) = ticket.id else { continue };
+                let screen_name = ticket.screen_name.as_deref().or(screen.name.as_deref()).unwrap_or("未知场次");
+                let ticket_name = ticket.desc.as_deref().unwrap_or("未知票种");
+                if request.skip_words.as_ref().is_some_and(|words| {
+                    let screen = screen_name.to_lowercase();
+                    let ticket = ticket_name.to_lowercase();
+                    words.iter().any(|word| {
+                        let word = word.to_lowercase();
+                        screen.contains(&word) || ticket.contains(&word)
+                    })
+                }) {
                     continue;
                 }
-                let analyze_result = match serde_json::from_value::<CheckFakeResult>(check_result.clone()){
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::error!("解析假票结果失败，原因：{}", e);
-                        continue; // 继续重试
+                request.screen_id = screen_id.to_string();
+                request.ticket_id = ticket_id.to_string();
+                let target = match select_target(request) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        report_event(error.to_string(), true);
+                        continue;
                     }
                 };
-                    
-                  
-                let pay_result = analyze_result.data.pay_param;
-                // 通知成功
-                let task_result = TaskResult::GrabTicketResult(GrabTicketResult {
-                    task_id: task_id.to_string(),
-                    uid,
-                    success: true,
-                    message: "抢票成功".to_string(),
-                    order_id: Some(order_id.clone().to_string()), 
-                    pay_token: Some(pay_token.to_string()),
-                    confirm_result: Some(confirm_result.clone()),
-                    pay_result : Some(pay_result.clone()),
 
-                });
-                let _ = result_tx.send(task_result.clone()).await;
-                // 放在假票检测通过之后：前面的“下单成功！”日志之后仍可能 continue 重试
-                report(|t| {
-                    t.info_seed.last_event = Some(event("下单成功，等待付款", false));
-                    t.outcome = Some(TaskOutcome::Succeeded);
-                });
-
-                //修复由于挂在后台egui不运行导致任务管理器不加载导致不推送
-                let jump_url = Some(format!("bilibili://mall/web?url=https://mall.bilibili.com/neul-next/ticket/orderDetail.html?order_id={}", order_id.to_string()));
-                let pay_url = pay_result.code_url.clone();
-                let title = format!("恭喜{}抢票成功！", confirm_result.project_name);
-                let message = format!("抢票成功！\n项目：{}\n场次：{}\n票类型：{}\n支付链接：{}\n请尽快支付{}元，以免支付超时导致票丢失\n如果觉得本项目好用，可前往https://github.com/biliticket/bili_ticket_rush 帮我们点个小星星star收藏本项目以防走丢\n本项目完全免费开源，仅供学习使用，开发组不承担使用本软件造成的一切后果",confirm_result.project_name, confirm_result.screen_name, confirm_result.ticket_info.name, pay_url ,confirm_result.ticket_info.price * confirm_result.count as i64/ 100);
-                
-                let _ = &grab_ticket_req.biliticket.push_self.push_all_async(  &title, &message,&jump_url).await;
-                return Some((true,false)); // 成功，不需要继续重试
-                //有个问题：取的是缓存里的pushconfig，动态修改的新的推不了
-            }
-            
-            Err(e) => {
-                // 处理错误情况
-                match e {
-                    //需要继续重试的临时错误
-                    100001 | 429 | 900001=> 
-                    {
-                        log::info!("b站限速，正常现象");
-                        report_order_error("B 站限速，继续重试".to_string(), false, false);
-                        tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.3)).await; 
-
-                },
-                    100009 => { 
-                        log::info!("当前票种库存不足");
-                        report_order_error("库存不足（100009）".to_string(), false, false);
-                        //再次降速，不给b站服务器带来压力
-                        tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.6)).await; 
-
-                    },
-                    211 => {
-                        log::info!("很遗憾，差一点点抢到票，继续加油吧！");
-                        report_order_error("差一点抢到（211）".to_string(), false, false);
-                    }
-                    
-                    //需要暂停的情况
-                    3 => {
-                        log::info!("抢票速度过快，即将被硬控5秒");
-                        log::info!("暂停4.8秒");
-                        report_order_error("请求过快，暂停 5 秒".to_string(), false, false);
-                        tokio::time::sleep(tokio::time::Duration::from_secs_f32(4.8)).await;
-                    },
-                    
-                    //需要重新获取token的情况
-                    100041 | 100050 | 900002=> {
-                        log::info!("token失效，即将重新获取token");
-                        report_order_error("token 失效，重新获取".to_string(), false, false);
-                        return Some((true,true)); // 需要重新获取token
-                    },
-                    
-                    //需要终止抢票的致命错误
-                    100017 | 100016 => {
-                        log::info!("当前项目/类型/场次已停售");
-                        report_order_error("项目或票种已停售".to_string(), true, true);
-                        return Some((true,false));
-                    },
-                    1 => {
-                        log::error!("超人 请慢一点，这是仅限1人抢票的项目，或抢票格式有误，请重新提交任务");
-                        report_order_error("仅限 1 人或格式有误，请重新提交任务".to_string(), true, true);
-                        return Some((true,false));
-                    }
-                    83000004 => {
-                        log::error!("没有配置购票人信息！请重新配置");
-                        report_order_error("没有配置购票人".to_string(), true, true);
-                        return Some((true,false));
-                    },
-                    100079 | 100003  => {
-                        log::error!("购票人存在待付款订单，请前往支付或取消后重新下单");
-                        report_order_error("这个购票人有待付款订单，请先付款或取消后再试".to_string(), true, true);
-                        return Some((true,false));
-                    },
-                    100039 => {
-                        log::error!("活动收摊啦,下次要快点哦");
-                        report_order_error("活动收摊啦,下次要快点哦（100039）".to_string(), true, true);
-                        return Some((true,false));
-                    }
-                    
-                    209001 => {
-                        log::error!("当前项目只能选择一个购票人！不支持多选，请重新提交任务");
-                        report_order_error("当前项目只能选择一个购票人！不支持多选，请重新提交任务（209001）".to_string(), true, true);
-                        return Some((true,false));
-                    }
-                    737 => {
-                        log::error!("B站传了一个NUll回来，请看一下上一行的message提示信息，自行决定是否继续，如果取消请关闭重新打开该应用");
-                        report_order_error("B站传了一个NUll回来，请看一下上一行的message提示信息，自行决定是否继续，如果取消请关闭重新打开该应用（737）".to_string(), true, false);
-                    }
-                    
-                    999 => {
-                        log::error!("程序内部错误！传参错误");
-                        report_order_error("程序内部错误！传参错误（999）".to_string(), true, false);
-                    }
-                    919 => {
-                        log::error!("程序内部错误！该项目区分绑定非绑定项目错误，传入意外值，请尝试重新下单以及提出issue");
-                        report_order_error("程序内部错误！该项目区分绑定非绑定项目错误，传入意外值，请尝试重新下单以及提出issue（919）".to_string(), true, true);
-                        return Some((true,false));
-                    }
-
-                    //未知错误
-                    _ => {
-                        log::error!("下单失败，未知错误码：{} 可以提出issue收集上报该问题", e);
-                        report_order_error(format!("下单失败（{}）", e), true, false);
-                    }
+                report_event(format!("发现候选票档：{screen_name} {ticket_name}"), false);
+                let cpdd = token_generator(&request.cookie_manager, project.sale_begin);
+                match purchase_target(request, &target, cpdd, 5, 30, cancel).await {
+                    TargetExit::NextTarget(reason) => report_event(reason, true),
+                    TargetExit::Finished(outcome) => return outcome,
                 }
             }
         }
-        
-        // 增加重试计数并等待
-        order_retry_count += 1;
-        if grab_ticket_req.grab_mode == 2 {
-            if order_retry_count >= 30 {
-                log::error!("捡漏模式下单失败，已达最大重试次数，放弃该票种抢票，准备检测其他票种继续捡漏");
-                return Some((false,true));
+        report(|entry| {
+            entry.info_seed.phase = GrabPhase::Monitoring;
+            entry.info_seed.rounds += 1;
+            if entry.info_seed.last_event.as_ref().is_none_or(|last| !last.is_error) {
+                entry.info_seed.last_event = Some(event(format!("第 {} 轮检查完毕", entry.info_seed.rounds), false));
             }
-        } else if order_retry_count >= 60 {
-            log::error!("下单失败，已达最大重试次数(60)，停止本任务");
-            let _ = result_tx.send(TaskResult::GrabTicketResult(GrabTicketResult {
-                task_id: task_id.to_string(),
-                uid,
-                success: false,
-                message: "下单失败，已达最大重试次数(60)".to_string(),
-                order_id: None,
-                pay_token: None,
-                pay_result: None,
-                confirm_result: None,
-            })).await;
-            return Some((true,false));
+        });
+        if !wait_running(cancel, Duration::from_secs(2)).await {
+            return TaskOutcome::Stopped;
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.4)).await;
-        //降低速度，不带来b站服务器压力
+    }
+}
+
+async fn purchase_target(
+    request: &GrabTicketRequest,
+    target: &PurchaseTarget,
+    cpdd: Arc<Mutex<CTokenGenerator>>,
+    prepare_limit: u8,
+    create_limit: u32,
+    cancel: &mut watch::Receiver<bool>,
+) -> TargetExit {
+    let mut create_attempts = 0;
+    let mut refreshes = 0;
+    loop {
+        let (token, ptoken) = match prepare_token(request, target, &cpdd, prepare_limit, cancel).await {
+            Ok(tokens) => tokens,
+            Err(exit) => return exit,
+        };
+        let exit = match confirm_parameters(request, target, &token, cancel).await {
+            Ok(confirmation) => {
+                create_on_target(
+                    request, target, &cpdd, &token, &ptoken, confirmation,
+                    &mut create_attempts, create_limit, cancel,
+                ).await
+            }
+            Err(exit) => exit,
+        };
+        match exit {
+            PreparedExit::Target(exit) => return exit,
+            PreparedExit::RefreshToken { reason, delay } => {
+                if create_attempts == create_limit {
+                    return create_limit_reached(create_limit);
+                }
+                if refreshes == MAX_TOKEN_REFRESHES {
+                    return TargetExit::NextTarget(format!("购票 token 刷新已达上限：{reason}"));
+                }
+                refreshes += 1;
+                report_event(format!("购票 token 失效，重新准备（{refreshes}/{MAX_TOKEN_REFRESHES}）：{reason}"), false);
+                if !wait_running(cancel, delay).await {
+                    return TargetExit::Finished(TaskOutcome::Stopped);
+                }
+            }
+        }
+    }
+}
+
+async fn prepare_token(
+    request: &GrabTicketRequest,
+    target: &PurchaseTarget,
+    cpdd: &Arc<Mutex<CTokenGenerator>>,
+    limit: u8,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(String, String), TargetExit> {
+    let mut failures = 0;
+    loop {
+        report_phase(GrabPhase::Preparing);
+        let prepare = get_ticket_token(request.cookie_manager.clone(), cpdd.clone(), target, request.is_hot);
+        let result = while_running(cancel, prepare).await;
+        let (reason, delay) = match result {
+            Some(Ok(tokens)) => return Ok(tokens),
+            Some(Err(PurchaseApiError::Challenge(risk))) => {
+                report_phase(GrabPhase::Captcha);
+                let captcha = handle_risk_verification(
+                    request.cookie_manager.clone(),
+                    risk,
+                    &request.biliticket.config,
+                    &request.biliticket.account.csrf,
+                    request.local_captcha.clone(),
+                );
+                let reason = match while_running(cancel, tokio::time::timeout(CAPTCHA_TIMEOUT, captcha)).await {
+                    Some(Ok(Ok(()))) => "验证码已完成，继续准备购票".to_string(),
+                    Some(Ok(Err(error))) => format!("验证码处理失败：{error}"),
+                    Some(Err(_)) => "验证码处理超时".to_string(),
+                    None => return Err(TargetExit::Finished(TaskOutcome::Stopped)),
+                };
+                (reason, PREPARE_INTERVAL)
+            }
+            Some(Err(error)) => {
+                let reason = format!("准备购票失败：{error}");
+                let mut delay = PREPARE_INTERVAL.max(error.retry_after().unwrap_or_default());
+                match error {
+                    PurchaseApiError::Business { code, .. } => match business_rejection(code) {
+                        Some(BusinessRejection::Target) => return Err(TargetExit::NextTarget(reason)),
+                        Some(BusinessRejection::Task) => return Err(TargetExit::Finished(TaskOutcome::Ended(reason))),
+                        Some(BusinessRejection::Retry(wait)) => delay = delay.max(wait),
+                        _ => {}
+                    },
+                    PurchaseApiError::InvalidParameter(_) => {
+                        return Err(TargetExit::Finished(TaskOutcome::Ended(reason)));
+                    }
+                    _ => {}
+                }
+                (reason, delay)
+            }
+            None => return Err(TargetExit::Finished(TaskOutcome::Stopped)),
+        };
+        failures += 1;
+        if failures == limit {
+            return Err(TargetExit::NextTarget(format!("准备购票已达上限（{limit} 次）：{reason}")));
+        }
+        report_event(reason, true);
+        if !wait_running(cancel, delay).await {
+            return Err(TargetExit::Finished(TaskOutcome::Stopped));
+        }
+    }
+}
+
+async fn confirm_parameters(
+    request: &GrabTicketRequest,
+    target: &PurchaseTarget,
+    token: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<ConfirmTicketResult, PreparedExit> {
+    report_phase(GrabPhase::Confirming);
+    let mut failures = 0;
+    loop {
+        let confirm = confirm_ticket_order(request.cookie_manager.clone(), target, token);
+        let result = while_running(cancel, confirm).await;
+        let (reason, delay) = match result {
+            Some(Ok(confirmation)) => return Ok(confirmation),
+            Some(Err(error)) => {
+                let reason = format!("确认订单参数失败：{error}");
+                let mut delay = CONFIRM_INTERVAL.max(error.retry_after().unwrap_or_default());
+                match error {
+                    PurchaseApiError::Business { code, .. } => match business_rejection(code) {
+                        Some(BusinessRejection::RefreshToken) => return Err(PreparedExit::RefreshToken { reason, delay }),
+                        Some(BusinessRejection::Task) => return Err(PreparedExit::Target(TargetExit::Finished(TaskOutcome::Ended(reason)))),
+                        Some(BusinessRejection::Target) | None => {
+                            return Err(PreparedExit::Target(TargetExit::NextTarget(reason)));
+                        }
+                        Some(BusinessRejection::Retry(wait)) => delay = delay.max(wait),
+                    },
+                    PurchaseApiError::InvalidParameter(_) => {
+                        return Err(PreparedExit::Target(TargetExit::NextTarget(reason)));
+                    }
+                    _ => {}
+                }
+                (reason, delay)
+            }
+            None => return Err(PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped))),
+        };
+        failures += 1;
+        if failures == MAX_CONFIRM_ATTEMPTS {
+            return Err(PreparedExit::Target(TargetExit::NextTarget(format!(
+                "确认订单参数已达上限（{MAX_CONFIRM_ATTEMPTS} 次）：{reason}"
+            ))));
+        }
+        report_event(reason, true);
+        if !wait_running(cancel, delay).await {
+            return Err(PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped)));
+        }
+    }
+}
+
+fn create_limit_reached(limit: u32) -> TargetExit {
+    TargetExit::NextTarget(format!("创建订单已达上限（{limit} 次）"))
+}
+
+async fn create_on_target(
+    request: &GrabTicketRequest,
+    target: &PurchaseTarget,
+    cpdd: &Arc<Mutex<CTokenGenerator>>,
+    token: &str,
+    ptoken: &str,
+    confirm: ConfirmTicketResult,
+    attempts: &mut u32,
+    limit: u32,
+    cancel: &mut watch::Receiver<bool>,
+) -> PreparedExit {
+    let mut order = OrderContext {
+        order_id: None,
+        query_token: None,
+        project_id: request.project_id.clone(),
+        screen_id: request.screen_id.clone(),
+        ticket_id: request.ticket_id.clone(),
+        confirm,
+        state: OrderState::PendingConfirmation,
+    };
+    loop {
+        if *cancel.borrow() {
+            return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped));
+        }
+        if *attempts == limit {
+            return PreparedExit::Target(create_limit_reached(limit));
+        }
+        report_phase(GrabPhase::Grabbing);
+        let attempts_before = *attempts;
+        let create = create_order(
+            request.cookie_manager.clone(), cpdd.clone(), target, token, ptoken, &order.confirm,
+            request.is_hot, &request.biliticket, &request.buyer_info, true, attempts_before >= 3, false, None,
+            || report(|entry| {
+                // 取消和发送边界使用同一把锁。跨过边界后必须等待本次请求收束。
+                if *entry.cancel.borrow() {
+                    return false;
+                }
+                *attempts += 1;
+                entry.info_seed.attempts += 1;
+                entry.info_seed.order = Some(order.clone());
+                true
+            }),
+        );
+        let error = match tokio::time::timeout(REQUEST_TIMEOUT, create).await {
+            Ok(Ok(created)) => {
+                order.order_id = created.order_id;
+                order.query_token = created.query_token;
+                report(|entry| entry.info_seed.order = Some(order.clone()));
+                let outcome = check_existing_order(&request.cookie_manager, order, cancel).await;
+                return PreparedExit::Target(TargetExit::Finished(outcome));
+            }
+            Ok(Err(PurchaseApiError::Cancelled)) => return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped)),
+            Ok(Err(error)) => error,
+            Err(_) => {
+                let reason = "创建订单请求超时".to_string();
+                let outcome = if *attempts == attempts_before {
+                    if *cancel.borrow() { TaskOutcome::Stopped } else { TaskOutcome::Ended(reason) }
+                } else {
+                    unresolved_order(cancel, reason)
+                };
+                return PreparedExit::Target(TargetExit::Finished(outcome));
+            }
+        };
+        let reason = format!("创建订单失败：{error}");
+        let delay = CREATE_INTERVAL.max(error.retry_after().unwrap_or_default());
+        match error {
+            PurchaseApiError::Business { code, .. } => {
+                let Some(rejection) = business_rejection(code) else {
+                    return PreparedExit::Target(TargetExit::Finished(unresolved_order(cancel, reason)));
+                };
+                // 只有明确的业务拒绝才清掉本次发送记录，允许按类别继续。
+                report(|entry| entry.info_seed.order = None);
+                if *cancel.borrow() {
+                    return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped));
+                }
+                match rejection {
+                    BusinessRejection::Retry(wait) => {
+                        report_event(reason, false);
+                        if (*attempts < limit || request.grab_mode == 2)
+                            && !wait_running(cancel, delay.max(wait)).await
+                        {
+                            return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped));
+                        }
+                    }
+                    BusinessRejection::RefreshToken => return PreparedExit::RefreshToken { reason, delay },
+                    BusinessRejection::Target => return PreparedExit::Target(TargetExit::NextTarget(reason)),
+                    BusinessRejection::Task => {
+                        return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Ended(reason)));
+                    }
+                }
+            }
+            _ => {
+                let outcome = if *attempts == attempts_before {
+                    if *cancel.borrow() { TaskOutcome::Stopped } else { TaskOutcome::Ended(reason) }
+                } else {
+                    unresolved_order(cancel, reason)
+                };
+                return PreparedExit::Target(TargetExit::Finished(outcome));
+            }
+        }
+    }
+}
+
+fn unresolved_order(cancel: &watch::Receiver<bool>, reason: String) -> TaskOutcome {
+    report_event(reason.clone(), true);
+    if *cancel.borrow() {
+        TaskOutcome::Stopped
+    } else {
+        TaskOutcome::AwaitingConfirmation(reason)
+    }
+}
+
+async fn check_existing_order(
+    cookie_manager: &Arc<CookieManager>,
+    mut order: OrderContext,
+    cancel: &mut watch::Receiver<bool>,
+) -> TaskOutcome {
+    if *cancel.borrow() {
+        return TaskOutcome::Stopped;
+    }
+    let Some(query_token) = order.query_token.clone() else {
+        return unresolved_order(cancel, "订单已受理，缺少查询标识，请核对订单".to_string());
+    };
+    report_phase(GrabPhase::CheckingOrder);
+    let mut checks = 0;
+    loop {
+        let check = async {
+            // 在开始查单时扣预算。取消先于这一边界时，不发起新查询。
+            if report(|entry| *entry.cancel.borrow()) {
+                return Err(PurchaseApiError::Cancelled);
+            }
+            checks += 1;
+            check_fake_ticket(
+                cookie_manager.clone(), &order.project_id, &query_token, order.order_id.as_deref(),
+            ).await
+        };
+        let result = while_running(cancel, check).await;
+        let (reason, delay) = match result {
+            Some(Ok(checked)) => {
+                if order.order_id.is_none() {
+                    order.order_id = checked.order_id;
+                }
+                if let Some(payment) = checked.pay_result {
+                    order.state = OrderState::AwaitingPayment(payment);
+                    report(|entry| {
+                        entry.info_seed.order = Some(order);
+                        entry.info_seed.last_event = Some(event("订单已确认，等待付款", false));
+                    });
+                    return TaskOutcome::Succeeded;
+                }
+                report(|entry| entry.info_seed.order = Some(order.clone()));
+                (
+                    "等待订单支付信息".to_string(),
+                    ORDER_CHECK_INTERVAL.max(checked.retry_after.unwrap_or_default()),
+                )
+            }
+            Some(Err(PurchaseApiError::Cancelled)) | None => return TaskOutcome::Stopped,
+            Some(Err(error)) => (
+                format!("查询订单暂未确认：{error}"),
+                ORDER_CHECK_INTERVAL.max(error.retry_after().unwrap_or_default()),
+            ),
+        };
+        if checks == MAX_ORDER_CHECKS {
+            return unresolved_order(cancel, format!("订单查询已达上限（{MAX_ORDER_CHECKS} 次）：{reason}，请核对订单"));
+        }
+        report_event(reason, false);
+        if !wait_running(cancel, delay).await {
+            return TaskOutcome::Stopped;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::purchase_test::{with_responses, Endpoint, RecordedRequest, Reply};
+    use common::account::Account;
+    use common::captcha::LocalCaptcha;
+    use common::utility::CustomConfig;
+    use reqwest::StatusCode;
+    use serde_json::{json, Value};
+    use tokio::sync::Notify;
+
+    const SALE_BEGIN: i64 = 1_800_000_000;
+    type Response = (Endpoint, Reply);
+    type NoticeProbe = Box<dyn Fn(&PaymentNotice) + Send>;
+
+    tokio::task_local! {
+        static NOTICE_PROBE: NoticeProbe;
+    }
+
+    pub(super) fn observe_notice(notice: &PaymentNotice) {
+        let _ = NOTICE_PROBE.try_with(|probe| probe(notice));
+    }
+
+    struct Fixture {
+        guard: GrabRegistryGuard,
+        request: GrabTicketRequest,
+    }
+
+    struct Trace {
+        finished: FinishedTaskInfo,
+        requests: Vec<RecordedRequest>,
+        notices: Vec<(String, Option<String>)>,
+    }
+
+    impl Fixture {
+        fn new(mode: u8) -> Self {
+            let cookie_manager = Arc::new(CookieManager::from_client(Arc::new(reqwest::Client::new()), ""));
+            let account = Account {
+                uid: 123,
+                name: "测试账号".into(),
+                level: String::new(),
+                cookie: String::new(),
+                csrf: String::new(),
+                is_login: true,
+                account_status: String::new(),
+                vip_label: String::new(),
+                is_active: true,
+                avatar_url: None,
+                avatar_texture: None,
+                cookie_manager: Some(cookie_manager.clone()),
+            };
+            let mut biliticket = BilibiliTicket::new(
+                &mode,
+                &"购票测试".to_string(),
+                &CustomConfig::new(),
+                &account,
+                &PushConfig::new(),
+                &0,
+                "11",
+                "https://show.bilibili.com/",
+            );
+            biliticket.project_info = Some(serde_json::from_value(project_data(&[31])).unwrap());
+            biliticket.id_bind = 2;
+            let buyer_info = [100, 101].into_iter().map(|id| {
+                serde_json::from_value(json!({
+                    "id": id, "uid": 123, "personal_id": "", "name": "测试购票人",
+                    "tel": "", "id_type": 0, "is_default": 0,
+                })).unwrap()
+            }).collect();
+            let request = GrabTicketRequest {
+                task_id: "test-grab".into(),
+                uid: account.uid,
+                project_id: "11".into(),
+                screen_id: if mode == 2 { String::new() } else { "21".into() },
+                ticket_id: if mode == 2 { String::new() } else { "31".into() },
+                count: 2,
+                buyer_info,
+                cookie_manager,
+                biliticket,
+                grab_mode: mode,
+                status: TaskStatus::Pending,
+                start_time: None,
+                is_hot: true,
+                local_captcha: LocalCaptcha::default(),
+                skip_words: None,
+            };
+            let guard = GrabRegistryGuard {
+                registry: Arc::new(Mutex::new(HashMap::from([(
+                    request.task_id.clone(),
+                    GrabTaskEntry::new(&request, 1),
+                )]))),
+                finished: Arc::new(Mutex::new(Vec::new())),
+                task_id: request.task_id.clone(),
+            };
+            Self { guard, request }
+        }
+
+        async fn run(self, responses: Vec<Response>) -> Trace {
+            let finished = self.guard.finished.clone();
+            let finished_for_probe = finished.clone();
+            let registry = self.guard.registry.clone();
+            let registry_for_probe = registry.clone();
+            let notices = Arc::new(Mutex::new(Vec::new()));
+            let notices_for_probe = notices.clone();
+            let (_, requests) = NOTICE_PROBE.scope(
+                Box::new(move |notice| {
+                    assert!(registry_for_probe.lock().unwrap().is_empty());
+                    assert_eq!(finished_for_probe.lock().unwrap().len(), 1);
+                    notices_for_probe.lock().unwrap().push((notice.message.clone(), notice.jump_url.clone()));
+                }),
+                with_responses(responses, run_registered_grab_task(self.guard, self.request)),
+            ).await;
+            assert!(registry.lock().unwrap().is_empty());
+            let mut finished = finished.lock().unwrap();
+            assert_eq!(finished.len(), 1);
+            let notices = std::mem::take(&mut *notices.lock().unwrap());
+            Trace { finished: finished.pop().unwrap(), requests, notices }
+        }
+    }
+
+    fn project_data(skus: &[i64]) -> Value {
+        let tickets: Vec<Value> = skus.iter().map(|sku| json!({
+            "id": sku, "clickable": true, "desc": format!("票档 {sku}"), "sale_flag": {}
+        })).collect();
+        json!({
+            "id": 11, "name": "测试项目", "sale_begin": SALE_BEGIN,
+            "id_bind": 2, "hotProject": true,
+            "screen_list": [{
+                "id": 21, "name": "测试场次", "ticket_list": tickets, "clickable": true,
+                "sale_start": SALE_BEGIN, "sale_end": SALE_BEGIN + 60, "sale_flag_number": 2,
+                "show_date": "测试日期"
+            }]
+        })
+    }
+
+    fn clock(now: i64) -> Response {
+        (Endpoint::Clock, Reply::Json(json!({ "code": 0, "data": { "now": now } })))
+    }
+
+    fn prepare(token: &str) -> Response {
+        (Endpoint::Prepare, Reply::Json(json!({
+            "errno": 0, "data": { "token": token, "ptoken": format!("{token}-p") }
+        })))
+    }
+
+    fn confirm(amount: i64) -> Response {
+        (Endpoint::Confirm, Reply::Json(json!({
+            "errno": 0,
+            "data": {
+                "count": 2, "pay_money": amount, "project_name": "测试项目",
+                "screen_name": "测试场次", "ticket_info": { "name": "测试票档", "count": 2, "price": 999 }
+            }
+        })))
+    }
+
+    fn rejection(endpoint: Endpoint, code: i64) -> Response {
+        (endpoint, Reply::Json(json!({"errno": code, "msg": "测试接口拒绝"})))
+    }
+
+    fn created(order_id: Option<u64>, query_token: Option<&str>) -> Response {
+        (Endpoint::Create, Reply::Json(json!({
+            "errno": 0, "data": { "orderId": order_id, "token": query_token }
+        })))
+    }
+
+    fn payable(order_id: Option<u64>) -> Response {
+        (Endpoint::Check, Reply::Json(json!({
+            "errno": 0, "data": {
+                "orderId": order_id, "payParam": { "sign": "test", "code_url": "https://payment.invalid/" }
+            }
+        })))
+    }
+
+    fn query<'a>(request: &'a RecordedRequest, key: &str) -> Option<&'a str> {
+        request.query.iter().find_map(|(name, value)| (name == key).then_some(value.as_str()))
+    }
+
+    fn requests(trace: &Trace, endpoint: Endpoint) -> impl Iterator<Item = &RecordedRequest> {
+        trace.requests.iter().filter(move |request| request.endpoint == endpoint)
+    }
+
+    fn assert_amount_and_target(request: &RecordedRequest, sku: i64, amount: Option<i64>) {
+        let body = request.body.as_ref().unwrap();
+        assert_eq!(body["project_id"], 11);
+        assert_eq!(body["screen_id"], 21);
+        assert_eq!(body["sku_id"], sku);
+        assert_eq!(body["count"], 2);
+        if let Some(amount) = amount {
+            assert_eq!(body["pay_money"], amount);
+            let buyers: Vec<BuyerInfo> = serde_json::from_str(body["buyer_info"].as_str().unwrap()).unwrap();
+            assert_eq!(buyers.into_iter().map(|buyer| buyer.id).collect::<Vec<_>>(), [100, 101]);
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_mode_refreshes_and_checks_last_allowed_create() {
+        let mut fixture = Fixture::new(0);
+        fixture.request.biliticket.push_self.enabled = true;
+        let mut responses = vec![
+            clock(SALE_BEGIN),
+            prepare("before-confirm"),
+            rejection(Endpoint::Confirm, 900002),
+            prepare("before-create"),
+            confirm(0),
+            rejection(Endpoint::Create, 100041),
+            prepare("refreshed"),
+            confirm(0),
+        ];
+        responses.extend((0..58).map(|_| rejection(Endpoint::Create, 211)));
+        responses.extend([
+            created(None, Some("same+query")),
+            (Endpoint::Check, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
+            (Endpoint::Check, Reply::Json(json!({
+                "errno": 0, "data": { "orderId": 75, "payParam": { "sign": "test", "code_url": "" } }
+            }))),
+            payable(Some(75)),
+        ]);
+
+        let trace = fixture.run(responses).await;
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        assert_eq!(trace.finished.info.attempts, 60);
+        assert_eq!(trace.finished.info.uid, 123);
+        let order = trace.finished.info.order.as_ref().unwrap();
+        assert_eq!(order.order_id.as_deref(), Some("75"));
+        assert_eq!(order.query_token.as_deref(), Some("same+query"));
+        assert_eq!(order.confirm.pay_money, 0);
+        assert!(matches!(&order.state, OrderState::AwaitingPayment(_)));
+        assert_eq!(trace.notices.len(), 1);
+        assert!(trace.notices[0].0.contains("支付0.00元"));
+        assert!(trace.notices[0].1.as_deref().unwrap().ends_with("order_id=75"));
+
+        for prepare in requests(&trace, Endpoint::Prepare) {
+            assert_amount_and_target(prepare, 31, None);
+        }
+        let confirm_tokens: Vec<_> = requests(&trace, Endpoint::Confirm).map(|request| query(request, "token")).collect();
+        assert_eq!(confirm_tokens, [Some("before-confirm"), Some("before-create"), Some("refreshed")]);
+        for (index, create) in requests(&trace, Endpoint::Create).enumerate() {
+            assert_amount_and_target(create, 31, Some(0));
+            let token = if index == 0 { "before-create" } else { "refreshed" };
+            assert_eq!(create.body.as_ref().unwrap()["token"], token);
+            assert_eq!(query(create, "ptoken").unwrap(), format!("{token}-p"));
+        }
+        let checked: Vec<_> = requests(&trace, Endpoint::Check).collect();
+        assert_eq!(checked.len(), 3);
+        assert!(checked.iter().all(|request| query(request, "token") == Some("same+query")));
+        assert_eq!(checked.iter().map(|request| query(request, "orderId")).collect::<Vec<_>>(), [None, None, Some("75")]);
+    }
+
+    #[tokio::test]
+    async fn direct_mode_keeps_create_budget_across_refresh() {
+        let mut responses = vec![
+            prepare("before-create"), confirm(123),
+            rejection(Endpoint::Create, 100050),
+            prepare("refreshed"), confirm(123),
+        ];
+        responses.extend((0..59).map(|_| rejection(Endpoint::Create, 211)));
+        let trace = Fixture::new(1).run(responses).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("60 次")));
+        assert_eq!(trace.finished.info.attempts, 60);
+        assert!(trace.finished.info.order.is_none());
+        assert!(trace.notices.is_empty());
+        assert_eq!(requests(&trace, Endpoint::Prepare).count(), 2);
+        assert_eq!(requests(&trace, Endpoint::Confirm).count(), 2);
+        let creates: Vec<_> = requests(&trace, Endpoint::Create).collect();
+        assert_eq!(creates.len(), 60);
+        assert_eq!(creates[1].body.as_ref().unwrap()["token"], "refreshed");
+        for create in creates {
+            assert_amount_and_target(create, 31, Some(123));
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_mode_visits_next_ticket_in_the_same_screen_after_limit() {
+        let mut responses = vec![
+            (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[31, 32])}))),
+            prepare("initial"), confirm(123), rejection(Endpoint::Create, 900002),
+            prepare("refreshed"), confirm(123),
+        ];
+        responses.extend((0..28).map(|_| rejection(Endpoint::Create, 211)));
+        let retry_after = Duration::from_secs(1);
+        let (throttled, last_create, release_create) = hold(Reply::JsonWithRetryAfter(
+            json!({"errno": 100001, "msg": "测试明确限速拒绝"}),
+            retry_after,
+        ));
+        let (held_prepare, next_prepare, release_prepare) = hold(prepare("next-sku").1);
+        responses.extend([
+            (Endpoint::Create, throttled),
+            (Endpoint::Prepare, held_prepare),
+            confirm(123),
+            created(Some(76), Some("query")),
+            payable(Some(76)),
+        ]);
+
+        let (trace, ()) = tokio::join!(Fixture::new(2).run(responses), async {
+            tokio::time::timeout(Duration::from_secs(20), last_create.notified()).await.unwrap();
+            let rejected_at = tokio::time::Instant::now();
+            release_create.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), next_prepare.notified()).await.unwrap();
+            assert!(rejected_at.elapsed() >= retry_after);
+            release_prepare.notify_one();
+        });
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        assert_eq!(trace.finished.info.attempts, 31);
+        assert!(trace.notices.is_empty());
+        let order = trace.finished.info.order.as_ref().unwrap();
+        assert_eq!((order.project_id.as_str(), order.screen_id.as_str(), order.ticket_id.as_str()), ("11", "21", "32"));
+        assert_eq!(order.confirm.pay_money, 123);
+        let OrderState::AwaitingPayment(payment) = &order.state else { panic!("应进入待支付") };
+        assert!(PaymentNotice::new(order, payment).message.contains("支付1.23元"));
+        for (index, prepare) in requests(&trace, Endpoint::Prepare).enumerate() {
+            assert_amount_and_target(prepare, if index < 2 { 31 } else { 32 }, None);
+        }
+        for (index, create) in requests(&trace, Endpoint::Create).enumerate() {
+            assert_amount_and_target(create, if index < 30 { 31 } else { 32 }, Some(123));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_create_response_keeps_order_fact_and_never_sends_again() {
+        let (_, code_unknown) = rejection(Endpoint::Create, 737);
+        for reply in [
+            Reply::Http(StatusCode::TOO_MANY_REQUESTS, Some(Duration::from_secs(3))),
+            Reply::Http(StatusCode::BAD_GATEWAY, None),
+            Reply::TransportFailure,
+            Reply::ReadBodyFailure,
+            Reply::Raw(b"{bad json"),
+            Reply::Json(json!({"data": {}})),
+            code_unknown,
+        ] {
+            let trace = Fixture::new(1).run(vec![prepare("test"), confirm(0), (Endpoint::Create, reply)]).await;
+            assert!(matches!(trace.finished.outcome, TaskOutcome::AwaitingConfirmation(_)));
+            assert_eq!(trace.finished.info.attempts, 1);
+            let order = trace.finished.info.order.as_ref().unwrap();
+            assert!(order.order_id.is_none());
+            assert!(order.query_token.is_none());
+            assert!(matches!(&order.state, OrderState::PendingConfirmation));
+            assert!(trace.notices.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_create_preserves_partial_identifiers_and_queries_at_most_thirty_times() {
+        for order_id in [Some(75), None] {
+            let trace = Fixture::new(1).run(vec![prepare("test"), confirm(0), created(order_id, None)]).await;
+            assert!(matches!(trace.finished.outcome, TaskOutcome::AwaitingConfirmation(_)));
+            assert_eq!(requests(&trace, Endpoint::Check).count(), 0);
+            assert_eq!(trace.finished.info.order.unwrap().order_id, order_id.map(|id| id.to_string()));
+        }
+
+        let mut responses = vec![prepare("test"), confirm(0), created(Some(75), Some("query"))];
+        responses.extend((0..30).map(|index| (Endpoint::Check, match index % 3 {
+            0 => Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None),
+            1 => Reply::Raw(b"{"),
+            _ => Reply::Json(json!({"errno": 87654, "msg": "测试订单尚未完成"})),
+        })));
+        let trace = Fixture::new(1).run(responses).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::AwaitingConfirmation(reason) if reason.contains("30 次")));
+        assert_eq!(trace.finished.info.attempts, 1);
+        let checks: Vec<_> = requests(&trace, Endpoint::Check).collect();
+        assert_eq!(checks.len(), 30);
+        assert!(checks.iter().all(|request| query(request, "token") == Some("query") && query(request, "orderId") == Some("75")));
+        let order = trace.finished.info.order.as_ref().unwrap();
+        assert!(matches!(&order.state, OrderState::PendingConfirmation));
+        assert_eq!(order.order_id.as_deref(), Some("75"));
+        assert!(trace.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn payable_query_without_order_id_does_not_make_a_detail_link() {
+        let mut fixture = Fixture::new(1);
+        fixture.request.biliticket.push_self.enabled = true;
+        let trace = fixture.run(vec![prepare("test"), confirm(123), created(None, Some("query")), payable(None)]).await;
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        let order = trace.finished.info.order.unwrap();
+        assert!(matches!(order.state, OrderState::AwaitingPayment(_)));
+        assert!(order.order_id.is_none());
+        assert_eq!(trace.notices.len(), 1);
+        assert!(trace.notices[0].1.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_challenges_confirm_and_refresh_have_separate_finite_budgets() {
+        let mut responses = vec![clock(SALE_BEGIN)];
+        // 无风控参数的挑战会在现有验证码入口立即失败，不触发模型加载或网络。
+        responses.extend((0..5).map(|_| rejection(Endpoint::Prepare, -401)));
+        let trace = Fixture::new(0).run(responses).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("5 次")));
+        assert_eq!(requests(&trace, Endpoint::Prepare).count(), 5);
+        assert_eq!(trace.finished.info.attempts, 0);
+
+        let mut responses = vec![prepare("test")];
+        responses.extend((0..4).map(|_| (Endpoint::Confirm, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None))));
+        let trace = Fixture::new(1).run(responses).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("4 次")));
+        assert_eq!(requests(&trace, Endpoint::Confirm).count(), 4);
+        assert_eq!(trace.finished.info.attempts, 0);
+
+        let responses = (0..6).flat_map(|_| [
+            prepare("test"), confirm(0), rejection(Endpoint::Create, 100041)
+        ]).collect();
+        let trace = Fixture::new(1).run(responses).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("刷新已达上限")));
+        assert_eq!(trace.finished.info.attempts, 6);
+        assert_eq!(requests(&trace, Endpoint::Prepare).count(), 6);
+    }
+
+    #[tokio::test]
+    async fn confirmed_target_mismatch_and_local_buyer_failure_never_create() {
+        let (_, Reply::Json(mut wrong_confirmation)) = confirm(0) else { unreachable!() };
+        wrong_confirmation["data"]["count"] = json!(1);
+        let trace = Fixture::new(1).run(vec![prepare("test"), (Endpoint::Confirm, Reply::Json(wrong_confirmation))]).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("数量")));
+        assert_eq!(trace.finished.info.attempts, 0);
+
+        let mut fixture = Fixture::new(1);
+        fixture.request.buyer_info.clear();
+        let trace = fixture.run(vec![prepare("test"), confirm(0)]).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("购票人")));
+        assert_eq!(trace.finished.info.attempts, 0);
+        assert!(trace.finished.info.order.is_none());
+    }
+
+    #[tokio::test]
+    async fn monitor_rejects_invalid_shared_parameters_before_scanning() {
+        let mut fixture = Fixture::new(2);
+        fixture.request.count = 0;
+        let trace = fixture.run(Vec::new()).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("数量")));
+        assert!(trace.requests.is_empty());
+
+        let mut fixture = Fixture::new(2);
+        fixture.request.project_id = "0".into();
+        let trace = fixture.run(Vec::new()).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("项目 ID")));
+        assert!(trace.requests.is_empty());
+    }
+
+    fn hold(reply: Reply) -> (Reply, Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let reply = Reply::Wait { entered: entered.clone(), release: release.clone(), reply: Box::new(reply) };
+        (reply, entered, release)
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_create_and_interrupts_read_only_stages() {
+        for stage in [Endpoint::Confirm, Endpoint::Create, Endpoint::Check] {
+            let fixture = Fixture::new(1);
+            let registry = fixture.guard.registry.clone();
+            let task_id = fixture.request.task_id.clone();
+            let mut responses = vec![prepare("test")];
+            let reply = match stage {
+                Endpoint::Confirm => confirm(0).1,
+                Endpoint::Create => {
+                    responses.push(confirm(0));
+                    created(Some(75), Some("query")).1
+                }
+                Endpoint::Check => {
+                    responses.extend([confirm(0), created(Some(75), Some("query"))]);
+                    payable(Some(75)).1
+                }
+                _ => unreachable!(),
+            };
+            let (held, entered, release) = hold(reply);
+            responses.push((stage, held));
+
+            let (trace, ()) = tokio::join!(fixture.run(responses), async {
+                tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+                {
+                    let registry = registry.lock().unwrap();
+                    let entry = &registry[&task_id];
+                    assert_eq!(entry.info_seed.attempts, u32::from(stage != Endpoint::Confirm));
+                    if stage == Endpoint::Create {
+                        let order = entry.info_seed.order.as_ref().unwrap();
+                        assert!(order.order_id.is_none());
+                        assert!(order.query_token.is_none());
+                    }
+                    entry.cancel.send_replace(true);
+                }
+                if stage == Endpoint::Create {
+                    release.notify_one();
+                }
+            });
+            assert!(matches!(trace.finished.outcome, TaskOutcome::Stopped));
+            assert!(trace.notices.is_empty());
+            if stage == Endpoint::Confirm {
+                assert!(trace.finished.info.order.is_none());
+            } else {
+                let order = trace.finished.info.order.as_ref().unwrap();
+                assert!(matches!(&order.state, OrderState::PendingConfirmation));
+                assert_eq!(order.order_id.as_deref(), Some("75"));
+                assert_eq!(order.query_token.as_deref(), Some("query"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_wait_cancellation_never_starts_prepare() {
+        let fixture = Fixture::new(0);
+        let registry = fixture.guard.registry.clone();
+        let task_id = fixture.request.task_id.clone();
+        let (clock, entered, release) = hold(clock(SALE_BEGIN - 60).1);
+        let (trace, ()) = tokio::join!(fixture.run(vec![(Endpoint::Clock, clock)]), async {
+            tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if registry.lock().unwrap()[&task_id].info_seed.phase == GrabPhase::WaitingSale {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            registry.lock().unwrap()[&task_id].cancel.send_replace(true);
+        });
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Stopped));
+        assert_eq!(trace.requests.len(), 1);
+        assert_eq!(trace.finished.info.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_inflight_create_timeout_keeps_unknown_order() {
+        let fixture = Fixture::new(1);
+        let registry = fixture.guard.registry.clone();
+        let task_id = fixture.request.task_id.clone();
+        let (held, entered, _release) = hold(created(Some(75), Some("query")).1);
+        let (trace, ()) = tokio::join!(
+            fixture.run(vec![prepare("test"), confirm(0), (Endpoint::Create, held)]),
+            async {
+                tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+                registry.lock().unwrap()[&task_id].cancel.send_replace(true);
+            },
+        );
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Stopped));
+        assert_eq!(trace.finished.info.attempts, 1);
+        let order = trace.finished.info.order.unwrap();
+        assert!(matches!(order.state, OrderState::PendingConfirmation));
+        assert!(order.order_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn abnormal_exit_at_send_boundary_retains_unresolved_order() {
+        let fixture = Fixture::new(1);
+        let finished = fixture.guard.finished.clone();
+        let registry = fixture.guard.registry.clone();
+        // 脚本省略 create 响应，在实际构造和记录发送边界后触发夹具 panic。
+        let task = tokio::spawn(with_responses(
+            vec![prepare("test"), confirm(0)],
+            run_registered_grab_task(fixture.guard, fixture.request),
+        ));
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(registry.lock().unwrap().is_empty());
+        let finished = finished.lock().unwrap();
+        assert_eq!(finished.len(), 1);
+        assert!(matches!(finished[0].outcome, TaskOutcome::AwaitingConfirmation(_)));
+        assert_eq!(finished[0].info.attempts, 1);
+        let order = finished[0].info.order.as_ref().unwrap();
+        assert!(matches!(&order.state, OrderState::PendingConfirmation));
+        assert!(order.order_id.is_none());
     }
 }

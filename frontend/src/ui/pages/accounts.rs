@@ -17,6 +17,10 @@ use crate::ui::widgets::{self, button_ex, Check, Kind, Size};
 
 const ORDER_DETAIL_URL: &str = "https://mall.bilibili.com/neul-next/ticket/orderDetail.html?order_id=";
 
+pub fn open_order_detail(ctx: &egui::Context, order_id: &str) {
+    widgets::open_url(ctx, &format!("{ORDER_DETAIL_URL}{order_id}"));
+}
+
 pub fn render(app: &mut Myapp, ui: &mut Ui) {
     let p = palette(ui.ctx());
     if app.account_manager.accounts.is_empty() {
@@ -378,7 +382,7 @@ fn order_row(ui: &mut Ui, p: &Palette, order: &Order, cookie_manager: Option<&Ar
             button_ex(ui, "在浏览器打开", Kind::Ghost, Size::Sm, false, true)
         };
         if open.clicked() {
-            widgets::open_url(ui.ctx(), &format!("{ORDER_DETAIL_URL}{}", order.order_id));
+            open_order_detail(ui.ctx(), &order.order_id);
         }
         copy = button_ex(ui, "复制订单号", Kind::Ghost, Size::Sm, false, true).clicked();
         ui.add_space(10.0);

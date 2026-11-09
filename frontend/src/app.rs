@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use reqwest::{header, Client};
@@ -14,7 +14,6 @@ use common::login::QrCodeLoginStatus;
 use common::push::PushConfig;
 use common::show_orderlist::OrderResponse;
 use common::taskmanager::*;
-use common::ticket::*;
 use common::utility::CustomConfig;
 use common::utils::Config;
 
@@ -23,7 +22,7 @@ use crate::state::jobs::{self, Jobs, ServiceState};
 use crate::state::logs::{LogFilter, LogStore};
 use crate::state::persist::{self, Contact, SaveState, ThemeMode, UiConfig};
 use crate::state::remote::Remote;
-use crate::state::tasks::{PaymentInfo, TaskBoard, TasksTab};
+use crate::state::tasks::{TaskBoard, TasksTab};
 use crate::state::BuyerList;
 use crate::ui;
 use crate::ui::dialogs::{AddBuyerState, LoginState, QrState};
@@ -358,6 +357,20 @@ impl Myapp {
         self.buyers.insert(uid, state);
     }
 
+    pub fn open_account_orders(&mut self, uid: i64) {
+        if self.account(uid).and_then(|account| account.cookie_manager.as_ref()).is_none() {
+            self.toasts.warn(format!("请先登录原购票账号 UID {uid}"));
+            return;
+        }
+        self.close_dialog();
+        self.accounts_selected = Some(uid);
+        self.accounts_tab = AccountsTab::Orders;
+        self.page = Page::Accounts;
+        if !matches!(self.orders.get(&uid), Some(Remote::Loading { .. })) {
+            self.request_orders(uid);
+        }
+    }
+
     pub fn request_orders(&mut self, uid: i64) {
         let Some(account) = self.account_manager.accounts.iter().find(|a| a.uid == uid) else { return };
         let Some(cookie_manager) = account.cookie_manager.clone() else {
@@ -447,7 +460,7 @@ impl Myapp {
         self.policy = Some(policy);
     }
 
-    fn process_task_results(&mut self, frame: &mut eframe::Frame) {
+    fn process_task_results(&mut self) {
         for result in self.task_manager.get_results() {
             match result {
                 TaskResult::QrCodeLoginResult(qrcode_result) => {
@@ -590,11 +603,6 @@ impl Myapp {
                     self.buyers.insert(uid, state);
                     self.select_buyer_after_refresh(uid);
                 }
-                TaskResult::GrabTicketResult(grab_ticket_result) => {
-                    if grab_ticket_result.success {
-                        self.handle_grab_success(grab_ticket_result, frame);
-                    }
-                }
             }
         }
     }
@@ -614,68 +622,6 @@ impl Myapp {
             self.draft.selected_buyers.push(buyer.id);
         }
         self.draft.select_after_refresh = None;
-    }
-
-    fn handle_grab_success(&mut self, grab_ticket_result: GrabTicketResult, frame: &mut eframe::Frame) {
-        let pay_url = match grab_ticket_result.pay_result {
-            Some(ref data) => data.code_url.clone(),
-            None => {
-                log::error!("获取支付链接失败: {}", grab_ticket_result.message);
-                return;
-            }
-        };
-        let confirm_result = grab_ticket_result.confirm_result.clone().unwrap_or(ConfirmTicketResult {
-            project_name: "".to_string(),
-            screen_name: "".to_string(),
-            count: 0,
-            pay_money: 0,
-            ticket_info: ConfirmTicketInfo { name: "".to_string(), count: 0, price: 0 },
-        });
-        let order_id = grab_ticket_result.order_id.clone().unwrap_or_default();
-        let jump_url = Some(format!(
-            "bilibili://mall/web?url=https://mall.bilibili.com/neul-next/ticket/orderDetail.html?order_id={}",
-            order_id
-        ));
-        let title = format!("恭喜{}抢票成功！", confirm_result.project_name);
-        let message = format!("抢票成功！\n项目：{}\n场次：{}\n票类型：{}\n支付链接：{}\n请尽快支付{}元，以免支付超时导致票丢失\n如果觉得本项目好用，可前往https://github.com/biliticket/bili_ticket_rush 帮我们点个小星星star收藏本项目以防走丢\n本项目完全免费开源，仅供学习使用，开发组不承担使用本软件造成的一切后果", confirm_result.project_name, confirm_result.screen_name, confirm_result.ticket_info.name, pay_url, confirm_result.ticket_info.price * confirm_result.count as i64 / 100);
-        log::info!("{}", title);
-        log::info!("{}", message);
-        if self.push_config.enabled {
-            let push_request = TaskRequest::PushRequest(PushRequest {
-                title: title.clone(),
-                message: message.clone(),
-                push_type: PushType::All,
-                jump_url: jump_url.clone(),
-                push_config: self.push_config.clone(),
-            });
-            match self.task_manager.submit_task(push_request) {
-                Ok(task_id) => log::debug!("提交全渠道推送任务成功，任务ID: {}", task_id),
-                Err(e) => log::error!("提交推送任务失败: {}", e),
-            }
-        }
-
-        let amount_fen = if confirm_result.pay_money > 0 {
-            confirm_result.pay_money
-        } else {
-            confirm_result.ticket_info.price * confirm_result.count as i64
-        };
-        self.board.payments.push_back(PaymentInfo {
-            task_id: grab_ticket_result.task_id.clone(),
-            uid: grab_ticket_result.uid,
-            order_id,
-            code_url: pay_url,
-            project_name: confirm_result.project_name,
-            screen_name: confirm_result.screen_name,
-            ticket_name: confirm_result.ticket_info.name,
-            count: confirm_result.count,
-            amount_fen,
-            at: SystemTime::now(),
-        });
-        self.board.payment_index = self.board.payments.len() - 1;
-        self.close_dialog();
-        self.dialog = Dialog::Payment;
-        frame.request_user_attention(egui::UserAttentionType::Critical);
-        frame.focus();
     }
 
     fn sync_theme(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -733,9 +679,15 @@ impl eframe::App for Myapp {
         self.sync_theme(ctx, frame);
 
         jobs::poll(self);
-        self.process_task_results(frame);
+        self.process_task_results();
         self.ingest_logs();
-        self.board.refresh(&mut *self.task_manager);
+        if self.board.refresh(&mut *self.task_manager) {
+            self.board.payment_index = self.board.payments.len() - 1;
+            self.close_dialog();
+            self.dialog = Dialog::Payment;
+            frame.request_user_attention(egui::UserAttentionType::Critical);
+            frame.focus();
+        }
         self.request_missing_avatars(ctx);
 
         if self.settings_dirty_at.map_or(false, |at| at.elapsed() >= Duration::from_millis(800)) {

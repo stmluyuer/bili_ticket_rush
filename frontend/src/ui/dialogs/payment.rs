@@ -5,6 +5,7 @@ use eframe::egui::{self, load::SizedTexture, pos2, vec2, Color32, Rect, RichText
 use crate::app::{Dialog, Myapp};
 use crate::state::tasks::PaymentInfo;
 use crate::ui::modal::{self, ModalAction};
+use crate::ui::pages::accounts::open_order_detail;
 use crate::ui::theme::{bold, palette, Palette, Tone};
 use crate::ui::widgets::{self, Kind, Size};
 
@@ -12,7 +13,7 @@ const WIDTH: f32 = 660.0;
 const LEFT_W: f32 = 236.0;
 const QR_SIZE: f32 = 196.0;
 
-enum Action { Prev, Next, CopyOrder, CopyLink, OpenOrder, Paid }
+enum Action { Prev, Next, CopyOrder(String), CopyLink, OpenOrder(String), AccountOrders, Dismiss }
 
 pub fn show(app: &mut Myapp, ctx: &egui::Context) {
     let len = app.board.payments.len();
@@ -30,7 +31,7 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
     let result = modal::modal_with_badge(ctx, "payment_dialog", "抢到了，请尽快付款", badge, WIDTH, true, |ui| {
         if len > 1 {
             ui.horizontal(|ui| {
-                widgets::small(ui, format!("还有 {} 笔待付款", len - 1), p.text_2);
+                widgets::small(ui, format!("另有 {} 条付款提醒", len - 1), p.text_2);
                 if widgets::button_ex(ui, "上一笔", Kind::Ghost, Size::Sm, false, index > 0).clicked() {
                     action = Some(Action::Prev);
                 }
@@ -72,11 +73,15 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
 
         modal::footer(ui, |ui| {
             // 从右到左添加
-            if widgets::button_ex(ui, "我已付款，关闭", Kind::Primary, Size::Lg, false, true).clicked() {
-                action = Some(Action::Paid);
+            if widgets::button_ex(ui, "关闭付款提醒", Kind::Primary, Size::Lg, false, true).clicked() {
+                action = Some(Action::Dismiss);
             }
-            if widgets::button_ex(ui, "在浏览器打开订单", Kind::Secondary, Size::Lg, false, true).clicked() {
-                action = Some(Action::OpenOrder);
+            if let Some(order_id) = &pay.order_id {
+                if widgets::button_ex(ui, "在浏览器打开订单", Kind::Secondary, Size::Lg, false, true).clicked() {
+                    action = Some(Action::OpenOrder(order_id.clone()));
+                }
+            } else if widgets::button_ex(ui, "查看原账号订单", Kind::Secondary, Size::Lg, false, true).clicked() {
+                action = Some(Action::AccountOrders);
             }
             if widgets::button_ex(ui, "复制支付链接", Kind::Secondary, Size::Lg, false, true).clicked() {
                 action = Some(Action::CopyLink);
@@ -88,25 +93,20 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
     match action {
         Some(Action::Prev) => app.board.payment_index = index.saturating_sub(1),
         Some(Action::Next) => app.board.payment_index = (index + 1).min(len - 1),
-        Some(Action::CopyOrder) => {
-            widgets::copy_text(ctx, pay.order_id.clone());
+        Some(Action::CopyOrder(order_id)) => {
+            widgets::copy_text(ctx, order_id);
             app.toasts.success("已复制订单号");
         }
         Some(Action::CopyLink) => {
             widgets::copy_text(ctx, pay.code_url.clone());
             app.toasts.success("已复制支付链接");
         }
-        Some(Action::OpenOrder) => {
-            let url = format!("https://mall.bilibili.com/neul-next/ticket/orderDetail.html?order_id={}", pay.order_id);
-            widgets::open_url(ctx, &url);
-        }
-        Some(Action::Paid) => {
-            app.board.payments.remove(index);
+        Some(Action::OpenOrder(order_id)) => open_order_detail(ctx, &order_id),
+        Some(Action::AccountOrders) => app.open_account_orders(pay.uid),
+        Some(Action::Dismiss) => {
+            app.board.dismiss_payment_reminder();
             if app.board.payments.is_empty() {
-                app.board.payment_index = 0;
                 app.close_dialog();
-            } else {
-                app.board.payment_index = index.min(app.board.payments.len() - 1);
             }
         }
         None => {}
@@ -147,18 +147,22 @@ fn info_column(ui: &mut Ui, p: &Palette, pay: &PaymentInfo) -> Option<Action> {
         ui.label(RichText::new(widgets::money(pay.amount_fen)).font(bold(26.0)).color(p.text));
     });
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("订单号 {}", pay.order_id)).color(p.text));
-        if widgets::button_ex(ui, "复制", Kind::Ghost, Size::Sm, false, !pay.order_id.is_empty()).clicked() {
-            action = Some(Action::CopyOrder);
-        }
-    });
+    if let Some(order_id) = &pay.order_id {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("订单号 {order_id}")).color(p.text));
+            if widgets::button_ex(ui, "复制", Kind::Ghost, Size::Sm, false, true).clicked() {
+                action = Some(Action::CopyOrder(order_id.clone()));
+            }
+        });
+    } else {
+        widgets::small(ui, "订单号暂不可用", p.text_3);
+    }
 
     let at = chrono::DateTime::<chrono::Local>::from(pay.at).format("%H:%M:%S");
     let passed = SystemTime::now().duration_since(pay.at).map(|d| d.as_secs()).unwrap_or(0);
     widgets::small(
         ui,
-        format!("抢到于 {} · 已过去 {:02}:{:02}", at, passed / 60, passed % 60),
+        format!("确认于 {} · 已过去 {:02}:{:02}", at, passed / 60, passed % 60),
         p.text_3,
     );
 

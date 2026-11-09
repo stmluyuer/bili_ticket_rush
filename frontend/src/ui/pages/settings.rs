@@ -16,6 +16,22 @@ use crate::ui::widgets::{
 
 const LABEL_W: f32 = 160.0;
 
+// 保留样本中的设备、系统和内核版本组合；小米项仅保留 WebView 基础值，不含库街区后缀。
+const UA_PRESETS: [(&str, &str); 3] = [
+    (
+        "OPPO Find X6 Pro · Android 16",
+        "Mozilla/5.0 (Linux; Android 16; PGEM10 Build/BP2A.250605.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/145.0.7632.79 Mobile Safari/537.36",
+    ),
+    (
+        "小米 14 · Android 14",
+        "Mozilla/5.0 (Linux; Android 14; 23127PN0CC Build/UKQ1.230804.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/127.0.6533.2 Mobile Safari/537.36",
+    ),
+    (
+        "vivo X100 · Android 14",
+        "Mozilla/5.0 (Linux; Android 14; V2309A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36 VivoBrowser/28.0.0.0",
+    ),
+];
+
 /// 与 app.settings_expanded 的下标一一对应
 const CHANNELS: [&str; 7] = ["Bark", "PushPlus", "Server 酱", "钉钉机器人", "企业微信", "邮件（SMTP）", "Gotify"];
 
@@ -133,6 +149,24 @@ fn network(app: &mut Myapp, ui: &mut Ui, p: &Palette) -> bool {
         ui.horizontal_top(|ui| {
             ui.add_space(LABEL_W + 8.0);
             ui.add_enabled_ui(enabled, |ui| {
+                // 禁用区域继承外层横排布局，这里显式纵排，避免输入框被候选框挤窄。
+                ui.set_layout(Layout::top_down(Align::Min));
+                let selected = UA_PRESETS.iter()
+                    .find(|(_, ua)| *ua == app.custom_config.custom_ua)
+                    .map(|(label, _)| *label)
+                    .unwrap_or("自定义");
+                egui::ComboBox::from_id_source("custom_ua_preset")
+                    .width(ui.available_width())
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for (label, ua) in UA_PRESETS {
+                            changed |= ui.selectable_value(
+                                &mut app.custom_config.custom_ua,
+                                ua.to_owned(),
+                                label,
+                            ).changed();
+                        }
+                    });
                 let resp = text_field(
                     ui,
                     &mut app.custom_config.custom_ua,

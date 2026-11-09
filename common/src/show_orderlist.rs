@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OrderResponse {
     pub errno: i32,
-    pub errtag: i32,
+    pub errtag: String,
     pub msg: String,
     pub data: OrderData,
 }
@@ -37,8 +37,8 @@ pub struct ItemInfo{
     pub image: Option<String>,
     pub screen_id: String,
     pub screen_name: String,
-    pub screen_start_time: String,
-    pub screen_end_time: String,
+    pub screen_start_time: i64,
+    pub screen_end_time: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

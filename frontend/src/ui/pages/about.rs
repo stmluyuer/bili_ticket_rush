@@ -6,7 +6,7 @@ use crate::app::Myapp;
 use crate::ui::theme::{bold, palette, Palette, Tone};
 use crate::ui::widgets::{button_ex, card, copy_text, open_url, page_title, section_title, small, Kind, Size};
 
-const REPO_URL: &str = "https://github.com/biliticket/bili_ticket_rush";
+const REPO_URL: &str = "https://github.com/stmluyuer/bili_ticket_rush";
 const VC_REDIST_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
 
 const STEPS: [&str; 4] = [

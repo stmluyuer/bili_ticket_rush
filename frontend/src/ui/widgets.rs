@@ -156,13 +156,17 @@ pub fn button_ex(ui: &mut Ui, text: &str, kind: Kind, size: Size, busy: bool, en
 pub fn segmented<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let p = palette(ui.ctx());
     let mut changed = false;
+    let width = options.iter().map(|(_, label)| {
+        ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), p.text).size().x + 24.0
+    }).sum::<f32>() + options.len().saturating_sub(1) as f32 * 2.0;
     egui::Frame::none()
         .fill(p.sunken)
         .stroke(Stroke::new(1.0, p.border))
         .rounding(7.0)
         .inner_margin(2.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // 组选项保持阅读顺序，不继承页头操作区的从右到左布局。
+            ui.allocate_ui_with_layout(vec2(width, 26.0), Layout::left_to_right(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for (option, label) in options {
                     let selected = *value == *option;
@@ -204,7 +208,8 @@ pub fn text_field(ui: &mut Ui, value: &mut String, opts: FieldOpts) -> Response 
         let frame = egui::Frame::none().inner_margin(Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
             ui.set_width(width - 20.0);
             let layout = if opts.multiline_rows > 0 { Layout::left_to_right(Align::Min) } else { Layout::left_to_right(Align::Center) };
-            ui.with_layout(layout, |ui| {
+            // 高度由输入内容决定；with_layout 会吃满弹窗剩余高度。
+            ui.allocate_ui_with_layout(vec2(width - 20.0, 0.0), layout, |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(prefix) = opts.prefix {
                     ui.label(RichText::new(prefix).color(p.text_2));

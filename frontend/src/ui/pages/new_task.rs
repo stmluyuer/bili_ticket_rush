@@ -74,7 +74,8 @@ pub fn render(app: &mut Myapp, ui: &mut Ui) {
                 egui::Frame::none()
                     .inner_margin(Margin { left: 24.0, right: 24.0, top: 20.0, bottom: 24.0 })
                     .show(ui, |ui| {
-                        ui.set_max_width(680.0);
+                        // 最大宽度也不能超过侧栏分配后剩余的空间，否则会遮住任务摘要。
+                        ui.set_max_width(ui.available_width().min(680.0));
                         ui.spacing_mut().item_spacing.y = 16.0;
                         header(app, ui, &p);
                         account_card(app, ui, &p);

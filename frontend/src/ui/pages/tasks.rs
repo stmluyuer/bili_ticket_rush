@@ -383,7 +383,8 @@ fn card_stub(
     });
 
     let metric = |ui: &mut Ui, before: &str, value: String, after: &str, color: Color32| {
-        ui.with_layout(Layout::left_to_right(Align::Max), |ui| {
+        // 数值行只占内容高度，避免首张任务卡吞掉列表剩余高度。
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 0.0), Layout::left_to_right(Align::Max), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if !before.is_empty() {
                 widgets::small(ui, before, p.text_2);
@@ -537,11 +538,14 @@ fn log_toolbar(app: &mut Myapp, ui: &mut Ui) -> Option<LogAction> {
                     ui.selectable_value(&mut *filter_label, Some(label.clone()), display_label(label));
                 }
             });
-        widgets::text_field(
-            ui,
-            &mut app.log_filter.search,
-            FieldOpts { hint: "搜索日志", width: Some(180.0), id: Some("log_search"), ..Default::default() },
-        );
+        // 先分配整块搜索框宽度，让换行布局在空间不足时将它移到下一行。
+        ui.allocate_ui_with_layout(vec2(180.0, 32.0), Layout::top_down(Align::Min), |ui| {
+            widgets::text_field(
+                ui,
+                &mut app.log_filter.search,
+                FieldOpts { hint: "搜索日志", width: Some(180.0), id: Some("log_search"), ..Default::default() },
+            );
+        });
     };
     let follow = app.log_filter.follow;
     let mut right = |ui: &mut Ui, rtl: bool| {

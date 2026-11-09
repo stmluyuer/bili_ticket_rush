@@ -83,6 +83,7 @@ pub struct Myapp {
     pub dialog: Dialog,
     pub toasts: Toasts,
     pub draft: TaskDraft,
+    pub project_history: Vec<String>,
     pub buyers: HashMap<i64, Remote<BuyerList>>,
     pub orders: HashMap<i64, Remote<OrderResponse>>,
     pub board: TaskBoard,
@@ -154,6 +155,8 @@ impl Myapp {
         let first_uid = accounts.first().map(|a| a.uid);
         let mut draft = TaskDraft::default();
         draft.account_uid = first_uid;
+        draft.project_input = "1007551".to_string();
+        draft.parsed = parse_project_input(&draft.project_input);
         draft.skip_words = persist::load_skip_words(&config);
 
         let mut app = Self {
@@ -194,6 +197,7 @@ impl Myapp {
             dialog: Dialog::None,
             toasts: Toasts::default(),
             draft,
+            project_history: persist::load_project_history(&config),
             buyers: HashMap::new(),
             orders: HashMap::new(),
             board: TaskBoard::default(),
@@ -307,6 +311,7 @@ impl Myapp {
     pub fn fetch_project(&mut self) {
         let Some(uid) = self.draft.account_uid else { return };
         let ParseResult::Id { id, referer } = self.draft.parsed.clone() else { return };
+        self.remember_project(&id);
         let Some(cookie_manager) = self.account(uid).and_then(|a| a.cookie_manager.clone()) else {
             self.draft.project = Remote::Failed { message: "账号登录信息失效，请重新登录".into(), at: Instant::now() };
             return;
@@ -419,6 +424,15 @@ impl Myapp {
         }
     }
 
+    pub fn remember_project(&mut self, id: &str) {
+        self.project_history.retain(|entry| entry != id);
+        self.project_history.insert(0, id.to_owned());
+        if let Err(e) = persist::save_project_history(&mut self.config, &self.project_history) {
+            log::error!("保存项目历史失败: {}", e);
+            self.toasts.push(Tone::Danger, "保存项目历史失败", Some(e), None);
+        }
+    }
+
     pub fn save_contacts(&mut self) {
         if let Err(e) = persist::save_contacts(&mut self.config, &self.contacts) {
             log::error!("保存联系人失败: {}", e);
@@ -428,16 +442,21 @@ impl Myapp {
     /// 原 check_policy：写入公告；不允许运行时打开不可关闭的对话框
     pub fn apply_policy(&mut self, policy: Value, connected: bool) {
         self.service = if connected { ServiceState::Connected } else { ServiceState::Offline };
-        if let Some(announcement) = policy.get("announcement1").and_then(|v| v.as_str()) {
-            log::info!("公告: {}", announcement);
-            self.announce1 = Some(announcement.to_string());
-        }
-        if let Some(announcement) = policy.get("announcement2").and_then(|v| v.as_str()) {
-            self.announce2 = Some(announcement.to_string());
-        }
-        if let Some(announcement) = policy.get("announcement3").and_then(|v| v.as_str()) {
-            self.announce3 = Some(announcement.to_string());
-        }
+        // 在公告入口移除群宣传，让所有页面共用过滤后的内容。
+        let visible_announcement = |key: &str| {
+            policy.get(key).and_then(|v| v.as_str()).and_then(|text| {
+                let text = text.lines()
+                    .filter(|line| !line.contains('群') && !line.contains("1012873573")
+                        && !line.contains("qm.qq.com") && !line.contains("qun.qq.com"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = text.trim();
+                if text.is_empty() { None } else { Some(text.to_string()) }
+            })
+        };
+        self.announce1 = visible_announcement("announcement1");
+        self.announce2 = visible_announcement("announcement2");
+        self.announce3 = visible_announcement("announcement3");
         if let Some(announcement) = policy.get("announcement4").and_then(|v| v.as_str()) {
             self.announce4 = Some(announcement.to_string());
         }

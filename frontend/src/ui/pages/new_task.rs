@@ -464,6 +464,40 @@ fn project_input(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
     if sync_input(app) {
         fetch = true;
     }
+    let mut selected = None;
+    let mut copied = None;
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_source("new_task_project_history")
+            .selected_text("历史项目")
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                if app.project_history.is_empty() {
+                    ui.label("暂无历史记录");
+                }
+                for id in &app.project_history {
+                    let current = matches!(&app.draft.parsed, ParseResult::Id { id: current, .. } if current == id);
+                    if ui.selectable_label(current, id).clicked() {
+                        selected = Some(id.clone());
+                    }
+                }
+            });
+        if let ParseResult::Id { id, .. } = &app.draft.parsed {
+            if button_ex(ui, "复制编号", Kind::Secondary, Size::Sm, false, true).clicked() {
+                widgets::copy_text(ui.ctx(), id.clone());
+                copied = Some(id.clone());
+            }
+        }
+    });
+    if let Some(id) = selected {
+        app.draft.project_input = id.clone();
+        sync_input(app);
+        app.remember_project(&id);
+        fetch = true;
+    }
+    if let Some(id) = copied {
+        app.remember_project(&id);
+        app.toasts.success("已复制项目编号");
+    }
     if fetch && can_fetch(app) {
         app.fetch_project();
     }
@@ -1354,6 +1388,7 @@ fn submit(app: &mut Myapp) {
     match app.task_manager.submit_task(TaskRequest::GrabTicketRequest(request)) {
         Ok(task_id) => {
             log::info!("提交抢票任务成功，任务ID: {}", task_id);
+            app.remember_project(&parsed_id);
             app.board.submitted.push((task_id, key.0, key.1, key.2));
             if let Some(contact) = contact {
                 app.contacts.insert(uid.to_string(), contact);

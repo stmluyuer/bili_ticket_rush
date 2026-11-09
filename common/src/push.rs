@@ -151,7 +151,7 @@ impl PushConfig{
                 failures.push(format!("Gotify推送出错: {}", msg));
             }
         }
-        if success_count == 0{
+        if success_count == 0 || failure_count > 0 {
             return (false, format!("{} 成功 / {} 失败。失败详情: {}", 
                            success_count, failure_count, failures.join("; ")))
         }else{
@@ -248,6 +248,7 @@ impl PushConfig{
         let url = format!("https://api.day.app/{}", self.bark_token);
         match client.post(&url)
             .json(&data)
+            .timeout(std::time::Duration::from_secs(20))
             .send()
             .await{
                 Ok(resp) => {
@@ -280,6 +281,7 @@ impl PushConfig{
         });
         match client.post(url)
             .json(&data)
+            .timeout(std::time::Duration::from_secs(20))
             .send()
             .await{
                 Ok(resp) => {
@@ -312,6 +314,7 @@ impl PushConfig{
         });
         match client.post(url)
             .json(&data)
+            .timeout(std::time::Duration::from_secs(20))
             .send()
             .await{
                 Ok(resp) => {
@@ -347,6 +350,7 @@ impl PushConfig{
             .json(&data)
             .header("Content-Type", "application/json")
             .header("Charset", "UTF-8")
+            .timeout(std::time::Duration::from_secs(20))
             .send()
             .await{
                 Ok(resp) => {
@@ -382,6 +386,7 @@ impl PushConfig{
             .json(&data)
             .header("Content-Type", "application/json")
             .header("Charset", "UTF-8")
+            .timeout(std::time::Duration::from_secs(20))
             .send()
             .await{
                 Ok(resp) => {
@@ -424,4 +429,35 @@ impl SmtpConfig{
         }
     }
     
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::{Read, Write}, net::TcpListener, time::Duration};
+
+    #[tokio::test]
+    async fn partial_channel_failure_is_not_reported_as_all_successful() {
+        // 只使用回环地址，验证真实的渠道汇总调用，不发送外部通知。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = [0; 4096];
+            assert!(connection.read(&mut request).unwrap() > 0);
+            connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+        });
+        let mut config = PushConfig::new();
+        config.enabled = true;
+        config.smtp_config.smtp_server = "unimplemented-test-channel".into();
+        config.gotify_config.gotify_url = format!("http://{address}");
+        config.gotify_config.gotify_token = "test-only-token".into();
+        let (success, message) = tokio::time::timeout(
+            Duration::from_secs(3), config.push_all_async("测试", "测试", &None),
+        ).await.unwrap();
+        server.join().unwrap();
+        assert!(!success);
+        assert!(message.contains("1 成功 / 1 失败"), "{message}");
+    }
 }

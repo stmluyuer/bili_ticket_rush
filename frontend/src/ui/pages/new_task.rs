@@ -42,27 +42,23 @@ pub fn render(app: &mut Myapp, ui: &mut Ui) {
     request_buyers_if_needed(app);
     normalize_selection(app);
 
-    if matches!(app.dialog, Dialog::None)
-        && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter))
-        && missing(app).is_empty()
-    {
-        submit(app);
-    }
+    let keyboard_submit = matches!(app.dialog, Dialog::None)
+        && ui.input_mut(|input| consume_submit_shortcut(&mut input.events));
 
     // 摘要栏要在中央内容之前声明，才能先占住右侧或底部
-    if ui.ctx().screen_rect().width() >= 1100.0 {
+    let button_submit = if ui.ctx().screen_rect().width() >= 1100.0 {
         egui::SidePanel::right("summary")
             .exact_width(320.0)
             .resizable(false)
             .show_separator_line(false)
             .frame(egui::Frame::none().inner_margin(Margin { left: 0.0, right: 24.0, top: 20.0, bottom: 24.0 }))
-            .show_inside(ui, |ui| summary_panel(app, ui, &p));
+            .show_inside(ui, |ui| summary_panel(app, ui, &p)).inner
     } else {
         egui::TopBottomPanel::bottom("summary_bar")
             .resizable(false)
             .frame(egui::Frame::none().fill(p.surface).inner_margin(Margin::symmetric(24.0, 10.0)))
-            .show_inside(ui, |ui| summary_bar(app, ui, &p));
-    }
+            .show_inside(ui, |ui| summary_bar(app, ui, &p)).inner
+    };
 
     egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
         egui::ScrollArea::vertical()
@@ -87,6 +83,26 @@ pub fn render(app: &mut Myapp, ui: &mut Ui) {
                     });
             });
     });
+
+    if (keyboard_submit || button_submit) && matches!(app.dialog, Dialog::None) {
+        submit(app);
+    }
+}
+
+fn consume_submit_shortcut(events: &mut Vec<egui::Event>) -> bool {
+    let mut submit = false;
+    events.retain(|event| match event {
+        egui::Event::Key { key: Key::Enter, pressed: true, repeat, modifiers, .. }
+            if modifiers.matches(Modifiers::COMMAND) =>
+        {
+            submit |= !*repeat;
+            false
+        }
+        // egui 也会把焦点按钮上的 Enter 和空格转成点击，只接受一次按下。
+        egui::Event::Key { key: Key::Enter | Key::Space, pressed: true, repeat: true, .. } => false,
+        _ => true,
+    });
+    submit
 }
 
 // ---------------------------------------------------------------- 状态同步
@@ -1120,7 +1136,10 @@ fn summary(app: &Myapp) -> Summary {
             None
         }
     };
-    let total = (d.mode != 2).then(|| (n, ticket.map(|t| t.price.unwrap_or(0) as i64 * n as i64)));
+    let total = (d.mode != 2).then(|| {
+        let estimate = ticket.and_then(|t| i64::try_from(t.price?).ok()?.checked_mul(i64::from(n)));
+        (n, estimate)
+    });
 
     Summary {
         rows: vec![
@@ -1159,7 +1178,7 @@ fn start_label(app: &Myapp, s: &Summary) -> &'static str {
     }
 }
 
-fn summary_panel(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
+fn summary_panel(app: &mut Myapp, ui: &mut Ui, p: &Palette) -> bool {
     let s = summary(app);
     let mut start = false;
     let mut clear = false;
@@ -1197,7 +1216,7 @@ fn summary_panel(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
 
                     if let Some((n, fen)) = s.total {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("合计 {n} 张")).color(p.text_2));
+                            ui.label(RichText::new(format!("标价预估 · {n} 张")).color(p.text_2));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let amount = fen.map(widgets::money).unwrap_or_else(|| "—".into());
                                 ui.label(RichText::new(amount).font(bold(20.0)).color(p.text));
@@ -1222,12 +1241,10 @@ fn summary_panel(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
                     ui.vertical_centered(|ui| clear = clear_link(ui, p).clicked());
                 });
         });
-    if start {
-        submit(app);
-    }
     if clear {
         clear_selection(app);
     }
+    start
 }
 
 fn kv_row(ui: &mut Ui, p: &Palette, key: &str, value: &str) {
@@ -1252,13 +1269,13 @@ fn draft_countdown_text(secs: i64) -> String {
 }
 
 /// 窄宽底栏：左侧摘要，右侧主按钮
-fn summary_bar(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
+fn summary_bar(app: &mut Myapp, ui: &mut Ui, p: &Palette) -> bool {
     let s = summary(app);
     let mut start = false;
     let mut clear = false;
     let left = match s.total {
-        Some((_, Some(fen))) => format!("{} · {} · {} 人", s.ticket_text, widgets::money(fen), s.people),
-        Some((_, None)) => format!("{} · — · {} 人", s.ticket_text, s.people),
+        Some((_, Some(fen))) => format!("{} · 标价预估 {} · {} 人", s.ticket_text, widgets::money(fen), s.people),
+        Some((_, None)) => format!("{} · {} 人", s.ticket_text, s.people),
         None => format!("{} · {} 人", s.ticket_text, s.people),
     };
     ui.horizontal(|ui| {
@@ -1291,12 +1308,10 @@ fn summary_bar(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
             });
         });
     });
-    if start {
-        submit(app);
-    }
     if clear {
         clear_selection(app);
     }
+    start
 }
 
 /// 清空项目、场次、票种、购票人选择，数量回 1；保留账号、模式、关键词
@@ -1315,6 +1330,9 @@ fn clear_selection(app: &mut Myapp) {
 
 /// 取值与旧 confirm_ticket.rs（模式 0/1）、confirm_ticket2.rs（模式 2）一致，见规格 6.2
 fn submit(app: &mut Myapp) {
+    if !missing(app).is_empty() {
+        return;
+    }
     let Some(uid) = app.draft.account_uid else { return };
     let Some(account) = app.account(uid).cloned() else { return };
     let Some(cookie_manager) = account.cookie_manager.clone() else { return };
@@ -1427,6 +1445,7 @@ fn submit(app: &mut Myapp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, fs, process::Command};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -1446,15 +1465,15 @@ mod tests {
     use crate::state::BuyerList;
 
     #[derive(Default)]
-    struct CaptureRequests(Arc<Mutex<Vec<GrabTicketRequest>>>);
+    struct CaptureRequests(Arc<Mutex<Vec<TaskRequest>>>);
 
     impl TaskManager for CaptureRequests {
         fn new() -> Self { Self::default() }
         fn submit_task(&mut self, request: TaskRequest) -> Result<String, String> {
-            let TaskRequest::GrabTicketRequest(request) = request else { unreachable!() };
+            let is_order_query = matches!(&request, TaskRequest::GetAllorderRequest(_));
             self.0.lock().unwrap().push(request);
             // 只记录实际提交，不运行任务或写入项目历史。
-            Err("测试已截获任务".into())
+            if is_order_query { Ok("order-query".into()) } else { Err("测试已截获任务".into()) }
         }
         fn get_results(&mut self) -> Vec<TaskResult> { unreachable!() }
         fn cancel_task(&mut self, _: &str) -> Result<(), String> { unreachable!() }
@@ -1481,11 +1500,12 @@ mod tests {
             "screen_list": [{
                 "id": 5, "clickable": true, "sale_end": 0, "sale_start": sale_start - 60,
                 "sale_flag_number": 1, "show_date": "",
-                "ticket_list": [{"id": 7, "price": 100, "saleStart": sale_start, "sale_flag": {}}],
+                "ticket_list": [{"id": 7, "price": 100, "saleStart": sale_start, "sale_flag": {}, "clickable": true}],
             }],
         })).unwrap();
         let draft = TaskDraft {
             account_uid: Some(uid),
+            project_input: "100001".into(),
             parsed: parse_project_input("100001"),
             project: Remote::Ready { value: project, at: Instant::now() },
             screen_idx: Some(0),
@@ -1574,6 +1594,7 @@ mod tests {
         assert_eq!(app.config["custom_config"]["sale_delay_ms"], 0);
         let requests = requests.lock().unwrap();
         let settings: Vec<_> = requests.iter().map(|request| {
+            let TaskRequest::GrabTicketRequest(request) = request else { unreachable!() };
             let config = &request.biliticket.config;
             (request.grab_mode, config.stock_check, config.sale_delay_ms,
              config.stock_interval_ms, config.create_interval_ms)
@@ -1595,5 +1616,119 @@ mod tests {
         assert!(preview.missing.iter().any(|reason| reason.contains("缺少可靠的开售时间")));
         submit(&mut app);
         assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn summary_distinguishes_missing_list_price_from_a_free_ticket() {
+        let mut app = app_for_submit(CaptureRequests::default(), 1_800_000_000);
+        let Remote::Ready { value: project, .. } = &mut app.draft.project else { unreachable!() };
+        project.screen_list[0].ticket_list[0].price = None;
+        assert_eq!(summary(&app).total, Some((1, None)));
+
+        let Remote::Ready { value: project, .. } = &mut app.draft.project else { unreachable!() };
+        project.screen_list[0].ticket_list[0].price = Some(0);
+        assert_eq!(summary(&app).total, Some((1, Some(0))));
+    }
+
+    #[test]
+    fn shortcut_requires_a_fresh_keypress_at_both_summary_widths() {
+        for width in [1000.0, 1200.0] {
+            let manager = CaptureRequests::default();
+            let requests = manager.0.clone();
+            let mut app = app_for_submit(manager, 1_800_000_000);
+            let ctx = egui::Context::default();
+            crate::ui::theme::configure_fonts(&ctx);
+            let screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 760.0)));
+            // egui 在窗口首次获焦时清空已按下键，先跑一帧完成获焦再发送输入。
+            let _ = ctx.run(egui::RawInput { screen_rect, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| render(&mut app, ui));
+            });
+            assert!(requests.lock().unwrap().is_empty());
+
+            for (step, (pressed, expected)) in [(true, 1), (true, 1), (false, 1), (true, 2)].into_iter().enumerate() {
+                let modifiers = Modifiers::COMMAND;
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect,
+                    modifiers,
+                    events: vec![egui::Event::Key { key: Key::Enter, pressed, repeat: false, modifiers }],
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| render(&mut app, ui));
+                });
+                assert_eq!(requests.lock().unwrap().len(), expected, "width={width}, step={step}");
+            }
+        }
+    }
+
+    #[test]
+    fn order_lookup_requires_the_original_logged_in_uid() {
+        let manager = CaptureRequests::default();
+        let requests = manager.0.clone();
+        let mut app = app_for_submit(manager, 1_800_000_000);
+        let mut signed_out = app.account_manager.accounts[0].clone();
+        signed_out.uid = 43;
+        signed_out.is_login = false;
+        app.account_manager.accounts.insert(0, signed_out);
+        app.accounts_selected = Some(43);
+
+        for uid in [43, 99] {
+            app.open_account_orders(uid);
+            assert_eq!(app.page, Page::NewTask);
+            assert_eq!(app.accounts_selected, Some(43));
+            assert!(requests.lock().unwrap().is_empty());
+        }
+
+        app.open_account_orders(42);
+        assert_eq!(app.page, Page::Accounts);
+        assert_eq!(app.accounts_tab, AccountsTab::Orders);
+        assert_eq!(app.accounts_selected, Some(42));
+        assert!(matches!(app.orders.get(&42), Some(Remote::Loading { task_id, .. }) if task_id == "order-query"));
+        assert!(matches!(&requests.lock().unwrap()[..], [TaskRequest::GetAllorderRequest(request)] if request.account_id == "42"));
+    }
+
+    #[test]
+    fn purchase_settings_retry_and_exit_save_current_values() {
+        const CHILD_ENV: &str = "BILI_TICKET_RUSH_SETTINGS_RETRY_EXIT_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let mut app = app_for_submit(CaptureRequests::default(), 1_800_000_000);
+            fs::create_dir("config").unwrap();
+            app.custom_config.sale_delay_ms = 275;
+            app.mark_settings_dirty();
+            app.save_settings_now();
+            assert!(matches!(app.settings_save, SaveState::Failed(_)));
+
+            fs::remove_dir("config").unwrap();
+            app.custom_config.sale_delay_ms = 875;
+            app.save_settings_now();
+            assert!(matches!(app.settings_save, SaveState::Saved));
+            assert_eq!(Config::load_config().unwrap()["custom_config"]["sale_delay_ms"], 875);
+
+            app.custom_config.stock_check = true;
+            app.custom_config.stock_interval_ms = 3200;
+            app.custom_config.create_interval_ms = 825;
+            app.mark_settings_dirty();
+            eframe::App::on_exit(&mut app, None);
+            let loaded = Config::load_config().unwrap();
+            let config: CustomConfig = serde_json::from_value(loaded["custom_config"].clone()).unwrap();
+            assert!(config.stock_check);
+            assert_eq!(config.sale_delay_ms, 875);
+            assert_eq!(config.stock_interval_ms, 3200);
+            assert_eq!(config.create_interval_ms, 825);
+            return;
+        }
+
+        // Config 路径相对于当前目录，独立进程的失败夹具与实际配置隔离。
+        let dir = env::temp_dir().join(format!("bili-ticket-settings-retry-exit-{:016x}", rand::random::<u64>()));
+        fs::create_dir(&dir).unwrap();
+        let output = Command::new(env::current_exe().unwrap())
+            .current_dir(&dir)
+            .env(CHILD_ENV, "1")
+            .args(["--exact", "ui::pages::new_task::tests::purchase_settings_retry_and_exit_save_current_values"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && stdout.contains("1 passed"), "{}\n{stdout}\n{}", dir.display(), String::from_utf8_lossy(&output.stderr));
+        fs::remove_file(dir.join("config")).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 }

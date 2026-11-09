@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Instant, SystemTime};
 use common::taskmanager::{FinishedTaskInfo, OrderState, RunningTaskInfo, TaskManager};
 
@@ -24,8 +24,10 @@ pub struct PaymentInfo {
 pub struct TaskBoard {
     pub running: Vec<RunningTaskInfo>,
     pub finished: Vec<FinishedTaskInfo>,
+    finished_ids: HashSet<String>,
     pub payments: VecDeque<PaymentInfo>,
     pub payment_index: usize,
+    payment_dialog_pending: bool,
     pub submitted: Vec<(String, i64, String, String)>,
     pub stop_confirm: Option<(String, Instant)>,
 }
@@ -38,7 +40,7 @@ impl TaskBoard {
         let previous_payments = self.payments.len();
         for finished in manager.take_finished_tasks() {
             let info = &finished.info;
-            if self.finished.iter().any(|record| record.info.task_id == info.task_id) {
+            if !self.finished_ids.insert(info.task_id.clone()) {
                 continue;
             }
             if let Some(order) = &info.order {
@@ -60,6 +62,13 @@ impl TaskBoard {
             }
             self.finished.push(finished);
         }
+        // 任务可能在读取进行中快照后结束。同一帧以已经取到的终态为准。
+        self.running.retain(|info| !self.finished_ids.contains(&info.task_id));
+        if self.stop_confirm.as_ref().is_some_and(|(id, at)| {
+            self.finished_ids.contains(id) || at.elapsed().as_secs() >= 3
+        }) {
+            self.stop_confirm = None;
+        }
         self.finished.sort_by_key(|finished| {
             let payable = matches!(
                 finished.info.order.as_ref().map(|order| &order.state),
@@ -67,10 +76,13 @@ impl TaskBoard {
             );
             Reverse((payable, finished.finished_at))
         });
-        if self.stop_confirm.as_ref().map_or(false, |(_, at)| at.elapsed().as_secs() >= 3) {
-            self.stop_confirm = None;
-        }
-        self.payments.len() > previous_payments
+        let new_payment = self.payments.len() > previous_payments;
+        self.payment_dialog_pending |= new_payment;
+        new_payment
+    }
+
+    pub fn take_pending_payment_dialog(&mut self) -> bool {
+        std::mem::take(&mut self.payment_dialog_pending)
     }
 
     pub fn clear_finished(&mut self) {
@@ -98,18 +110,23 @@ mod tests {
     use super::*;
     use common::taskmanager::{GrabPhase, OrderContext, TaskOutcome, TaskRequest, TaskResult, TaskStatus};
     use common::ticket::{CheckFakeResultData, ConfirmTicketInfo, ConfirmTicketResult};
+    use crate::app::Dialog;
+    use crate::ui::dialogs::LoginState;
 
     #[derive(Default)]
-    struct FinishedQueue(Vec<FinishedTaskInfo>);
+    struct TaskSnapshots {
+        running: Vec<RunningTaskInfo>,
+        finished: Vec<FinishedTaskInfo>,
+    }
 
-    impl TaskManager for FinishedQueue {
+    impl TaskManager for TaskSnapshots {
         fn new() -> Self { Self::default() }
         fn submit_task(&mut self, _: TaskRequest) -> Result<String, String> { unreachable!() }
         fn get_results(&mut self) -> Vec<TaskResult> { unreachable!() }
         fn cancel_task(&mut self, _: &str) -> Result<(), String> { unreachable!() }
         fn get_task_status(&self, _: &str) -> Option<TaskStatus> { unreachable!() }
-        fn list_running_tasks(&self) -> Vec<RunningTaskInfo> { Vec::new() }
-        fn take_finished_tasks(&mut self) -> Vec<FinishedTaskInfo> { std::mem::take(&mut self.0) }
+        fn list_running_tasks(&self) -> Vec<RunningTaskInfo> { self.running.clone() }
+        fn take_finished_tasks(&mut self) -> Vec<FinishedTaskInfo> { std::mem::take(&mut self.finished) }
         fn shutdown(&mut self) { unreachable!() }
     }
 
@@ -167,7 +184,7 @@ mod tests {
     fn refresh_uses_confirmed_amount_and_original_uid_once() {
         let stopped = finished("task-1", 123, TaskOutcome::Stopped, Some(order(None, 0, payable())));
         let succeeded = finished("task-2", 456, TaskOutcome::Succeeded, Some(order(Some("42"), 105, payable())));
-        let mut manager = FinishedQueue(vec![stopped.clone(), stopped, succeeded]);
+        let mut manager = TaskSnapshots { finished: vec![stopped.clone(), stopped, succeeded], ..Default::default() };
         let mut board = TaskBoard::default();
 
         assert!(board.refresh(&mut manager));
@@ -189,14 +206,17 @@ mod tests {
         let pending = finished("pending", 123, TaskOutcome::Stopped, Some(order(Some("42"), 105, OrderState::PendingConfirmation)));
         let payment = finished("payment", 456, TaskOutcome::Succeeded, Some(order(None, 105, payable())));
         let failure = finished("failure", 456, TaskOutcome::Ended("明确拒绝".into()), None);
-        let mut manager = FinishedQueue(vec![pending, payment.clone(), failure]);
+        let mut manager = TaskSnapshots {
+            finished: vec![pending, payment.clone(), failure.clone()],
+            ..Default::default()
+        };
         let mut board = TaskBoard::default();
 
         assert!(board.refresh(&mut manager));
         assert_eq!(board.payments.len(), 1);
         board.dismiss_payment_reminder();
         board.clear_finished();
-        manager.0.push(payment);
+        manager.finished.extend([payment, failure]);
         assert!(!board.refresh(&mut manager));
         assert!(board.payments.is_empty());
         assert_eq!(board.finished.len(), 2);
@@ -205,5 +225,53 @@ mod tests {
         assert_eq!(pending.info.order.as_ref().unwrap().order_id.as_deref(), Some("42"));
         let payment = board.finished.iter().find(|record| record.info.task_id == "payment").unwrap();
         assert!(matches!(payment.info.order.as_ref().unwrap().state, OrderState::AwaitingPayment(_)));
+    }
+
+    #[test]
+    fn refresh_prefers_finished_over_older_running_snapshot() {
+        let completed = finished("completed", 123, TaskOutcome::Stopped, None);
+        let mut manager = TaskSnapshots {
+            running: vec![completed.info.clone(), finished("running", 123, TaskOutcome::Stopped, None).info],
+            finished: vec![completed],
+        };
+        let mut board = TaskBoard {
+            stop_confirm: Some(("completed".into(), Instant::now())),
+            ..Default::default()
+        };
+
+        assert!(!board.refresh(&mut manager));
+        assert_eq!(board.running.len(), 1);
+        assert_eq!(board.running[0].task_id, "running");
+        assert_eq!(board.finished[0].info.task_id, "completed");
+        assert!(board.stop_confirm.is_none());
+    }
+
+    #[test]
+    fn payment_dialog_waits_for_login_and_keeps_current_order_selected() {
+        let first = finished("first", 123, TaskOutcome::Succeeded, Some(order(Some("42"), 105, payable())));
+        let mut manager = TaskSnapshots { finished: vec![first], ..Default::default() };
+        let mut board = TaskBoard::default();
+        let mut dialog = Dialog::Login(LoginState { qr_task: Some("login".into()), ..Default::default() });
+
+        assert!(board.refresh(&mut manager));
+        dialog.show_pending_payment(&mut board);
+        assert!(matches!(&dialog, Dialog::Login(state) if state.qr_task.as_deref() == Some("login")));
+
+        dialog = Dialog::None;
+        dialog.show_pending_payment(&mut board);
+        assert!(matches!(dialog, Dialog::Payment));
+        assert_eq!(board.payments[board.payment_index].task_id, "first");
+
+        let second = finished("second", 456, TaskOutcome::Succeeded, Some(order(Some("43"), 260, payable())));
+        manager.finished.push(second);
+        assert!(board.refresh(&mut manager));
+        dialog.show_pending_payment(&mut board);
+        assert_eq!(board.payments.len(), 2);
+        assert_eq!(board.payments[board.payment_index].task_id, "first");
+
+        dialog = Dialog::None;
+        dialog.show_pending_payment(&mut board);
+        assert!(matches!(dialog, Dialog::None));
+        assert_eq!(board.payments.len(), 2);
     }
 }

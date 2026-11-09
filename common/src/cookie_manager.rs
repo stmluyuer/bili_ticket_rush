@@ -470,8 +470,7 @@ impl CookieManager {
         builder
     }
 
-    /// 与 [`post_with_headers`] 完全相同的 cookie / header 处理逻辑，
-    /// 仅把底层客户端换成 rustls 后端的 `h2_client`（强制走 HTTP/2）。
+    /// 使用创建订单和连接预热共享的客户端，由 TLS ALPN 协商 HTTP/2。
     pub async fn post_with_headers_h2(&self, url: &str, headers: HashMap<&str, &str>) -> reqwest::RequestBuilder {
         let builder = self.h2_client.post(url);
         self.prepare_request_with_overrides(builder, &headers)

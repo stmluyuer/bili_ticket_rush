@@ -199,7 +199,8 @@ impl BilibiliTicket{
             id_bind: 999,
 
         };
-        log::debug!("新建抢票对象：{:?}",new);
+        // 快照含账号凭证、购票人和通知密钥，不输出整个对象。
+        log::debug!("已创建购票任务快照，模式：{}", new.method);
         new
 
     }

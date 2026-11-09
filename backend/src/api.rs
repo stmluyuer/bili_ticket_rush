@@ -141,19 +141,21 @@ pub async fn get_project_live(
     cookie_manager: Arc<CookieManager>,
     project_id: &str,
     referer_link: &str,
-) -> Result<InfoResponse, String> {
+) -> Result<InfoResponse, PurchaseApiError> {
+    let expected_id = project_id.parse::<i32>().ok().filter(|id| *id > 0)
+        .ok_or_else(|| PurchaseApiError::InvalidParameter("项目 ID 无效".into()))?;
     let url = "https://show.bilibili.com/api/ticket/project/getV2";
     let request = cookie_manager
         .get_with_headers(url, HashMap::from([("Referer", referer_link)]))
         .await
         .query(&[("id", project_id), ("project_id", project_id)]);
-    let (value, retry_after) = send_purchase(request).await.map_err(|error| error.to_string())?;
-    purchase_data(&value, retry_after).map_err(|error| error.to_string())?;
+    let (value, retry_after) = send_purchase(request).await?;
+    purchase_data(&value, retry_after)?;
     let mut info = InfoResponse::deserialize(value)
-        .map_err(|error| format!("解析项目详情失败：{error}"))?;
-    info.data.validate()?;
-    if info.data.id != project_id.parse::<i32>().ok() {
-        return Err(format!("项目详情的 ID 与请求项目 {project_id} 不符"));
+        .map_err(|error| PurchaseApiError::Parse(format!("项目详情：{error}")))?;
+    info.data.validate().map_err(PurchaseApiError::Parse)?;
+    if info.data.id != Some(expected_id) {
+        return Err(PurchaseApiError::Parse(format!("项目详情的 ID 与请求项目 {project_id} 不符")));
     }
     info.data.raw_sale_begin = info.data.sale_begin.filter(|time| *time > 0);
     info.data.fill_missing_sale_begin();
@@ -173,14 +175,17 @@ pub async fn get_project(
             save_project_cache(project_id, &info);
             Ok(info)
         }
+        Err(e @ PurchaseApiError::InvalidParameter(_)) => Err(e.to_string()),
         Err(e) => {
             log::warn!("在线获取项目信息失败({}), 尝试从本地缓存加载...", e);
-            match load_project_cache(project_id) {
+            match load_project_cache(project_id).filter(|cached| {
+                cached.data.id.is_some_and(|id| project_id.parse::<i32>() == Ok(id))
+            }) {
                 Some(cached) => {
                     log::info!("已降级使用本地缓存的项目信息");
                     Ok(cached)
                 }
-                None => Err(e),
+                None => Err(e.to_string()),
             }
         }
     }
@@ -327,6 +332,10 @@ pub enum PurchaseApiError {
         message: String,
         retry_after: Option<Duration>,
     },
+    UnconfirmedOrder {
+        order: CreatedOrder,
+        reason: Box<PurchaseApiError>,
+    },
     Http {
         status: StatusCode,
         retry_after: Option<Duration>,
@@ -343,6 +352,7 @@ impl PurchaseApiError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Business { retry_after, .. } | Self::Http { retry_after, .. } => *retry_after,
+            Self::UnconfirmedOrder { reason, .. } => reason.retry_after(),
             _ => None,
         }
     }
@@ -352,6 +362,7 @@ impl std::fmt::Display for PurchaseApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Business { code, message, .. } => write!(f, "业务码 {code}，{message}"),
+            Self::UnconfirmedOrder { reason, .. } => write!(f, "收到订单标识但受理状态待核实：{reason}"),
             Self::Http { status, .. } => write!(f, "HTTP {status}"),
             Self::Transport(error) => write!(f, "请求失败：{}", error),
             Self::ReadBody(error) => write!(f, "读取响应失败：{}", error),
@@ -372,7 +383,7 @@ pub struct CreatedOrder {
 #[derive(Debug)]
 pub struct CheckOrderResult {
     pub order_id: Option<String>,
-    pub pay_result: Option<CheckFakeResultData>,
+    pub pay_result: Result<Option<CheckFakeResultData>, PurchaseApiError>,
     pub retry_after: Option<Duration>,
 }
 
@@ -455,7 +466,7 @@ async fn execute_purchase(
     purchase_response(response, exact_ok).await
 }
 
-async fn send_purchase(request: RequestBuilder) -> Result<(Value, Option<Duration>), PurchaseApiError> {
+pub(crate) async fn send_purchase(request: RequestBuilder) -> Result<(Value, Option<Duration>), PurchaseApiError> {
     let (client, request) = request.timeout(PURCHASE_TIMEOUT).build_split();
     let request = request.map_err(|error| {
         PurchaseApiError::InvalidParameter(format!("无法构造购票请求：{}", error.without_url()))
@@ -463,9 +474,14 @@ async fn send_purchase(request: RequestBuilder) -> Result<(Value, Option<Duratio
     execute_purchase(client, request, false).await
 }
 
-fn purchase_data(value: &Value, retry_after: Option<Duration>) -> Result<&Value, PurchaseApiError> {
-    let errno = value["errno"].as_i64();
-    let code = value["code"].as_i64();
+pub(crate) fn purchase_data(value: &Value, retry_after: Option<Duration>) -> Result<&Value, PurchaseApiError> {
+    let read_code = |field: &str| {
+        value.get(field).map(|code| {
+            code.as_i64().ok_or_else(|| PurchaseApiError::Parse(format!("业务码 {field} 无效")))
+        }).transpose()
+    };
+    let errno = read_code("errno")?;
+    let code = read_code("code")?;
     match (errno, code) {
         (Some(errno), Some(code)) if errno != code => {
             Err(PurchaseApiError::Parse(format!("业务码不一致（errno {errno}，code {code}）")))
@@ -638,7 +654,7 @@ fn decode_confirmation(
     let data = purchase_data(value, retry_after)?;
     let confirm = ConfirmTicketResult::deserialize(data)
         .map_err(|error| PurchaseApiError::Parse(format!("确认参数：{error}")))?;
-    for fields in [data, &data["ticket_info"]] {
+    for fields in [value, data, &data["ticket_info"]] {
         confirm_target_id(fields, ["project_id", "projectId"], target.project_id)?;
         confirm_target_id(fields, ["screen_id", "screenId"], target.screen_id)?;
         confirm_target_id(fields, ["sku_id", "skuId"], target.sku_id)?;
@@ -675,11 +691,20 @@ fn decode_created_order(
     value: &Value,
     retry_after: Option<Duration>,
 ) -> Result<CreatedOrder, PurchaseApiError> {
-    let data = purchase_data(value, retry_after)?;
-    Ok(CreatedOrder {
+    let data = &value["data"];
+    let order = CreatedOrder {
         order_id: order_id(&data["orderId"]),
         query_token: nonempty_string(&data["token"]).map(str::to_owned),
-    })
+    };
+    match purchase_data(value, retry_after) {
+        Ok(_) => Ok(order),
+        // 明确拒绝时，单独回传的 token 可能是购票 token，无法用来关联订单。
+        Err(error @ PurchaseApiError::Business { .. }) if order.order_id.is_none() => Err(error),
+        Err(reason) if order.order_id.is_some() || order.query_token.is_some() => {
+            Err(PurchaseApiError::UnconfirmedOrder { order, reason: Box::new(reason) })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub async fn create_order(
@@ -786,23 +811,27 @@ fn decode_payment(
     expected_order_id: Option<&str>,
 ) -> Result<CheckOrderResult, PurchaseApiError> {
     let data = purchase_data(value, retry_after)?;
-    let order_id = order_id(&data["orderId"]);
+    let order_id = match &data["orderId"] {
+        Value::Null => None,
+        value => Some(order_id(value).ok_or_else(|| PurchaseApiError::Parse("查单响应的订单 ID 无效".into()))?),
+    };
     if let (Some(actual), Some(expected)) = (&order_id, expected_order_id) {
         if actual != expected {
             return Err(PurchaseApiError::Parse("查单响应的订单 ID 与当前订单不符".into()));
         }
     }
-    let pay_param = &data["payParam"];
-    let pay_result = if pay_param.is_null()
+    Ok(CheckOrderResult { order_id, pay_result: decode_pay_param(&data["payParam"]), retry_after })
+}
+
+fn decode_pay_param(pay_param: &Value) -> Result<Option<CheckFakeResultData>, PurchaseApiError> {
+    if pay_param.is_null()
         || (pay_param.is_object() && (pay_param["code_url"].is_null() || pay_param["sign"].is_null()))
     {
-        None
-    } else {
-        let pay_result = CheckFakeResultData::deserialize(pay_param)
-            .map_err(|error| PurchaseApiError::Parse(format!("支付信息：{error}")))?;
-        (!pay_result.code_url.trim().is_empty()).then_some(pay_result)
-    };
-    Ok(CheckOrderResult { order_id, pay_result, retry_after })
+        return Ok(None);
+    }
+    let pay_result = CheckFakeResultData::deserialize(pay_param)
+        .map_err(|error| PurchaseApiError::Parse(format!("支付信息：{error}")))?;
+    Ok((!pay_result.code_url.trim().is_empty()).then_some(pay_result))
 }
 
 pub async fn check_fake_ticket(
@@ -942,6 +971,7 @@ pub(crate) mod purchase_test {
         Confirm,
         Create,
         Check,
+        Orders,
         Project,
         Clock,
         Stock,
@@ -1023,6 +1053,7 @@ pub(crate) mod purchase_test {
                 "/api/ticket/order/confirmInfo" => Endpoint::Confirm,
                 "/api/ticket/order/createV2" => Endpoint::Create,
                 "/api/ticket/order/createstatus" => Endpoint::Check,
+                "/api/ticket/ordercenter/ticketList" => Endpoint::Orders,
                 "/api/ticket/project/getV2" => Endpoint::Project,
                 "/x/click-interface/click/now" => Endpoint::Clock,
                 "/api/ticket/stock/check" => Endpoint::Stock,
@@ -1166,6 +1197,12 @@ mod tests {
             decode_confirmation(&response, None, &target),
             Err(PurchaseApiError::InvalidParameter(_))
         ));
+        response["data"]["ticket_info"]["sku_id"] = json!(13);
+        response["projectId"] = json!(8);
+        assert!(matches!(
+            decode_confirmation(&response, None, &target),
+            Err(PurchaseApiError::InvalidParameter(_))
+        ));
         assert!(matches!(
             decode_confirmation(&json!({"errno": 100041, "msg": "token 失效"}), None, &target),
             Err(PurchaseApiError::Business { code: 100041, .. })
@@ -1179,11 +1216,21 @@ mod tests {
         let error = decode_created_order(&response, delay).unwrap_err();
         assert_eq!(error.retry_after(), delay);
         assert!(matches!(error, PurchaseApiError::Business { code: 100009, ref message, .. } if message == "库存不足"));
-        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY, StatusCode::CREATED] {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::CREATED,
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
             assert!(matches!(response_status(status, delay, true), Err(PurchaseApiError::Http { .. })));
         }
         assert!(matches!(decode_purchase_body(b"{"), Err(PurchaseApiError::Parse(_))));
-        for response in [json!({"data": {"orderId": 31}}), json!({"errno": 0, "code": 100009})] {
+        for response in [
+            json!({"data": {}}),
+            json!({"errno": 0, "code": 100009}),
+            json!({"errno": 0, "code": null}),
+            json!({"code": 100009, "errno": "0"}),
+        ] {
             assert!(matches!(decode_created_order(&response, None), Err(PurchaseApiError::Parse(_))));
         }
     }
@@ -1203,6 +1250,25 @@ mod tests {
         ).unwrap();
         assert_eq!(by_token.order_id, None);
         assert_eq!(by_token.query_token.as_deref(), Some("query-token"));
+
+        for response in [
+            json!({"code": 100079, "data": {"orderId": 31, "token": "query-token"}}),
+            json!({"code": 0, "errno": 100009, "data": {"orderId": 31, "token": "query-token"}}),
+            json!({"data": {"orderId": 31, "token": "query-token"}}),
+        ] {
+            let error = decode_created_order(&response, None).unwrap_err();
+            let PurchaseApiError::UnconfirmedOrder { order, .. } = error else {
+                panic!("未保留待核实订单：{error}");
+            };
+            assert_eq!(order.order_id.as_deref(), Some("31"));
+            assert_eq!(order.query_token.as_deref(), Some("query-token"));
+        }
+
+        let rejected = json!({"code": 100041, "data": {"token": "prepare-token"}});
+        assert!(matches!(
+            decode_created_order(&rejected, None),
+            Err(PurchaseApiError::Business { code: 100041, .. })
+        ));
     }
 
     #[tokio::test]
@@ -1215,6 +1281,12 @@ mod tests {
         payable["data"]["payParam"]["code_url"] = json!("weixin://pay/fixture");
         let mut no_code = payable.clone();
         no_code.as_object_mut().unwrap().remove("code");
+        let mut malformed_payment = payable.clone();
+        malformed_payment["data"]["payParam"]["code_url"] = json!(42);
+        let mut malformed_order_id = payable.clone();
+        malformed_order_id["data"]["orderId"] = json!("invalid-id");
+        let mut no_order_id = payable.clone();
+        no_order_id["data"].as_object_mut().unwrap().remove("orderId");
 
         let ((), requests) = with_responses(
             [
@@ -1222,11 +1294,14 @@ mod tests {
                 (Check, Reply::Json(no_code)),
                 (Check, Reply::Json(payable.clone())),
                 (Check, Reply::Json(payable)),
+                (Check, Reply::Json(malformed_payment)),
+                (Check, Reply::Json(malformed_order_id)),
+                (Check, Reply::Json(no_order_id)),
             ],
             async {
                 let pending = check_fake_ticket(cookies.clone(), "7", "query+token", None).await.unwrap();
                 assert_eq!(pending.order_id.as_deref(), Some("31"));
-                assert!(pending.pay_result.is_none());
+                assert!(pending.pay_result.unwrap().is_none());
                 assert!(matches!(
                     check_fake_ticket(cookies.clone(), "7", "query+token", Some("31")).await,
                     Err(PurchaseApiError::Parse(_))
@@ -1235,8 +1310,19 @@ mod tests {
                     check_fake_ticket(cookies.clone(), "7", "query+token", Some("32")).await,
                     Err(PurchaseApiError::Parse(_))
                 ));
-                let payable = check_fake_ticket(cookies, "7", "query+token", Some("31")).await.unwrap();
-                assert_eq!(payable.pay_result.unwrap().code_url, "weixin://pay/fixture");
+                let payable = check_fake_ticket(cookies.clone(), "7", "query+token", Some("31")).await.unwrap();
+                assert_eq!(payable.pay_result.unwrap().unwrap().code_url, "weixin://pay/fixture");
+
+                let malformed = check_fake_ticket(cookies.clone(), "7", "query+token", None).await.unwrap();
+                assert_eq!(malformed.order_id.as_deref(), Some("31"));
+                assert!(matches!(malformed.pay_result, Err(PurchaseApiError::Parse(_))));
+                assert!(matches!(
+                    check_fake_ticket(cookies.clone(), "7", "query+token", Some("31")).await,
+                    Err(PurchaseApiError::Parse(_))
+                ));
+                let by_token = check_fake_ticket(cookies, "7", "query+token", None).await.unwrap();
+                assert!(by_token.order_id.is_none());
+                assert!(by_token.pay_result.unwrap().is_some());
             },
         ).await;
         assert!(requests[0].query.iter().all(|(key, _)| key != "orderId"));
@@ -1307,7 +1393,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_project_requires_success_and_preserves_original_sale_begin() {
-        use purchase_test::{with_responses, Endpoint::Project, Reply};
+        use purchase_test::{seed_project_cache, with_responses, Endpoint::Project, Reply};
 
         let cookies = Arc::new(CookieManager::from_client(Arc::new(Client::new()), ""));
         let referer = "https://show.bilibili.com/platform/detail.html?id=7";
@@ -1328,7 +1414,8 @@ mod tests {
                 (Project, Reply::Json(json!({ "code": 0, "data": raw }))),
                 (Project, Reply::Json(json!({ "errno": 103, "data": data }))),
                 (Project, Reply::Json(json!({ "data": data }))),
-                (Project, Reply::Json(json!({ "code": 0, "data": other_project }))),
+                (Project, Reply::Json(json!({ "code": 0, "data": other_project.clone() }))),
+                (Project, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
                 (Project, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
                 (Project, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
             ],
@@ -1340,12 +1427,15 @@ mod tests {
                 assert_eq!(original.data.sale_begin, Some(2000));
                 assert_eq!(original.data.raw_sale_begin, Some(2000));
                 for message in ["业务码 103", "缺少有效业务码", "与请求项目 7 不符", "HTTP 503"] {
-                    let error = get_project_live(cookies.clone(), "7", referer).await.unwrap_err();
+                    let error = get_project_live(cookies.clone(), "7", referer).await.unwrap_err().to_string();
                     assert!(error.contains(message), "{error}");
                 }
-                let cached = get_project(cookies, "7", referer).await.unwrap();
+                let cached = get_project(cookies.clone(), "7", referer).await.unwrap();
                 assert_eq!(cached.data.sale_begin, Some(2000));
                 assert_eq!(cached.data.raw_sale_begin, None);
+                seed_project_cache("7", json!({ "code": 0, "data": other_project }));
+                let error = get_project(cookies, "7", referer).await.unwrap_err();
+                assert!(error.contains("HTTP 503"), "{error}");
             },
         ).await;
     }

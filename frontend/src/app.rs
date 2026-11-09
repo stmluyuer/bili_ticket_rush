@@ -45,6 +45,23 @@ pub enum Dialog {
     PolicyBlocked { message: String },
 }
 
+impl Dialog {
+    pub(crate) fn show_pending_payment(&mut self, board: &mut TaskBoard) {
+        // 付款提醒等当前对话框关闭，避免中断登录等尚未完成的操作。
+        match self {
+            Self::None if board.take_pending_payment_dialog() => {
+                board.payment_index = board.payments.len() - 1;
+                *self = Self::Payment;
+            }
+            Self::Payment => {
+                // 新提醒加入队列，当前展示的付款项保持选中。
+                board.take_pending_payment_dialog();
+            }
+            _ => {}
+        }
+    }
+}
+
 /// 设置页“发送测试推送”的状态，按推送任务 ID 匹配结果
 #[derive(Clone, Debug, PartialEq)]
 pub enum PushTest { Idle, Busy(String), Sent, Failed(String) }
@@ -363,7 +380,7 @@ impl Myapp {
     }
 
     pub fn open_account_orders(&mut self, uid: i64) {
-        if self.account(uid).and_then(|account| account.cookie_manager.as_ref()).is_none() {
+        if !self.account(uid).is_some_and(|account| account.is_login && account.cookie_manager.is_some()) {
             self.toasts.warn(format!("请先登录原购票账号 UID {uid}"));
             return;
         }
@@ -701,9 +718,6 @@ impl eframe::App for Myapp {
         self.process_task_results();
         self.ingest_logs();
         if self.board.refresh(&mut *self.task_manager) {
-            self.board.payment_index = self.board.payments.len() - 1;
-            self.close_dialog();
-            self.dialog = Dialog::Payment;
             frame.request_user_attention(egui::UserAttentionType::Critical);
             frame.focus();
         }
@@ -714,7 +728,14 @@ impl eframe::App for Myapp {
         }
 
         self.handle_shortcuts(ctx);
+        self.dialog.show_pending_payment(&mut self.board);
         ui::shell::render(self, ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.settings_dirty_at.is_some() {
+            self.save_settings_now();
+        }
     }
 }
 

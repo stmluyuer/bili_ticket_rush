@@ -278,21 +278,27 @@ fn card_main(
     outcome: Option<&TaskOutcome>,
     has_payment_reminder: bool,
 ) -> Option<Action> {
+    let order = outcome.and(info.order.as_ref());
+    let project_name = order.map_or(info.project_name.as_str(), |order| order.confirm.project_name.as_str());
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("No.{:04}", info.seq)).font(FontId::monospace(12.0)).color(p.text_3));
         let name_w = (ui.available_width() - 56.0).max(40.0);
         ui.allocate_ui_with_layout(vec2(name_w, 22.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.add(Label::new(RichText::new(&info.project_name).font(bold(15.0)).color(p.text)).truncate(true));
+            ui.add(Label::new(RichText::new(project_name).font(bold(15.0)).color(p.text)).truncate(true))
+                .on_hover_text(project_name);
         });
         widgets::pill(ui, mode_label(info.grab_mode), Tone::Neutral);
     });
 
-    let line2 = if info.target.is_empty() {
+    let line2 = if let Some(order) = order {
+        let confirm = &order.confirm;
+        format!("{} · {} · {} × {}", info.account_name, confirm.screen_name, confirm.ticket_info.name, confirm.count)
+    } else if info.target.is_empty() {
         info.account_name.clone()
     } else {
         format!("{} · {}", info.account_name, info.target)
     };
-    ui.add(Label::new(RichText::new(line2).size(12.0).color(p.text_2)).truncate(true));
+    ui.add(Label::new(RichText::new(&line2).size(12.0).color(p.text_2)).truncate(true)).on_hover_text(line2);
 
     let reason = match outcome {
         Some(TaskOutcome::AwaitingConfirmation(reason)) => Some((reason, p.warning)),
@@ -315,7 +321,7 @@ fn card_main(
     }
 
     let mut action = None;
-    if let (Some(_), Some(order)) = (outcome, &info.order) {
+    if let Some(order) = order {
         ui.horizontal_wrapped(|ui| {
             if let Some(order_id) = &order.order_id {
                 widgets::small(ui, format!("订单号 {order_id}"), p.text_2);

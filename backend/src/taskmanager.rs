@@ -86,8 +86,9 @@ struct GrabRegistryGuard {
 
 impl Drop for GrabRegistryGuard {
     fn drop(&mut self) {
-        let entry = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.task_id);
-        let Some(entry) = entry else { return };
+        // 在终态入队前保持注册表锁，先取运行快照再取终态时不会漏掉这个任务。
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = registry.remove(&self.task_id) else { return };
         let mut info = entry.info_seed;
         info.elapsed_secs = entry.start_time.elapsed().as_secs();
         let outcome = match entry.outcome {
@@ -704,10 +705,11 @@ impl TaskManager for TaskManagerImpl {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match registry.get(task_id) {
-            Some(entry) => {
+            Some(entry) if entry.outcome.is_none() => {
                 entry.cancel.send_replace(true);
                 Ok(())
             }
+            Some(_) => Err("任务已结束".to_string()),
             None => Err("任务不存在".to_string()),
         }
     }
@@ -770,7 +772,7 @@ const MAX_UNKNOWN_STOCK: u32 = 3;
 const INSUFFICIENT_STOCK: i64 = 100009;
 
 enum TargetExit {
-    NextTarget(String),
+    NextTarget { reason: String, delay: Duration },
     Finished(TaskOutcome),
 }
 
@@ -829,7 +831,8 @@ async fn run_registered_grab_task(guard: GrabRegistryGuard, mut request: GrabTic
         .scope(grab_ctx, TASK_LABEL.scope(task_label, async {
             let outcome = run_grab(&mut request, &mut cancel).await;
             report(|entry| {
-                entry.outcome = Some(outcome);
+                // 取消与结束按注册表锁排序，已经确认的支付信息独立保留。
+                entry.outcome = Some(if *entry.cancel.borrow() { TaskOutcome::Stopped } else { outcome });
                 if !push_config.enabled {
                     return None;
                 }
@@ -916,7 +919,7 @@ async fn run_grab(request: &mut GrabTicketRequest, cancel: &mut watch::Receiver<
             }
             let prepare_limit = if request.grab_mode == 0 { 5 } else { 10 };
             match purchase_target(request, &target, cpdd, prepare_limit, 60, cancel).await {
-                TargetExit::NextTarget(reason) => TaskOutcome::Ended(reason),
+                TargetExit::NextTarget { reason, .. } => TaskOutcome::Ended(reason),
                 TargetExit::Finished(outcome) => outcome,
             }
         }
@@ -999,9 +1002,6 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
     if request.count <= 0 {
         return TaskOutcome::Ended("购票数量必须大于 0".to_string());
     }
-    if !request.project_id.parse::<i64>().is_ok_and(|id| id > 0) {
-        return TaskOutcome::Ended("项目 ID 无效".to_string());
-    }
     let interval = Duration::from_millis(request.biliticket.config.stock_interval_ms);
     loop {
         report_phase(GrabPhase::Monitoring);
@@ -1010,11 +1010,13 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
         );
         let project = match while_running(cancel, project).await {
             Some(Ok(project)) => project.data,
+            Some(Err(error @ PurchaseApiError::InvalidParameter(_))) => return TaskOutcome::Ended(error.to_string()),
             Some(Err(error)) => {
+                let delay = interval.max(error.retry_after().unwrap_or_default());
                 let message = format!("实时项目扫描失败，候选状态未知：{error}");
                 log::warn!("{message}");
                 report_event(message, true);
-                if !wait_running(cancel, interval).await {
+                if !wait_running(cancel, delay).await {
                     return TaskOutcome::Stopped;
                 }
                 continue;
@@ -1027,6 +1029,7 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
         };
         request.biliticket.id_bind = id_bind;
         request.is_hot = project.hot_project.unwrap_or(false);
+        let mut next_request_delay = Duration::ZERO;
         for screen in project.screen_list.into_iter().filter(|screen| screen.clickable) {
             let Some(screen_id) = screen.id else { continue };
             for ticket in screen.ticket_list.into_iter().filter(|ticket| ticket.clickable == Some(true)) {
@@ -1055,11 +1058,17 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
                         continue;
                     }
                 };
+                if !next_request_delay.is_zero() && !wait_running(cancel, next_request_delay).await {
+                    return TaskOutcome::Stopped;
+                }
 
                 report_event(format!("发现候选票档：{screen_name} {ticket_name}"), false);
                 let cpdd = token_generator(&request.cookie_manager, project.sale_begin);
                 match purchase_target(request, &target, cpdd, 5, 30, cancel).await {
-                    TargetExit::NextTarget(reason) => report_event(reason, true),
+                    TargetExit::NextTarget { reason, delay } => {
+                        report_event(reason, true);
+                        next_request_delay = delay;
+                    }
                     TargetExit::Finished(outcome) => return outcome,
                 }
             }
@@ -1071,7 +1080,7 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
                 entry.info_seed.last_event = Some(event(format!("第 {} 轮检查完毕", entry.info_seed.rounds), false));
             }
         });
-        if !wait_running(cancel, interval).await {
+        if !wait_running(cancel, interval.max(next_request_delay)).await {
             return TaskOutcome::Stopped;
         }
     }
@@ -1105,10 +1114,13 @@ async fn purchase_target(
             PreparedExit::Target(exit) => return exit,
             PreparedExit::RefreshToken { reason, delay } => {
                 if create_attempts == create_limit {
-                    return create_limit_reached(create_limit);
+                    return create_limit_reached(create_limit, &reason, delay);
                 }
                 if refreshes == MAX_TOKEN_REFRESHES {
-                    return TargetExit::NextTarget(format!("购票 token 刷新已达上限：{reason}"));
+                    return TargetExit::NextTarget {
+                        reason: format!("购票 token 刷新已达上限：{reason}"),
+                        delay,
+                    };
                 }
                 refreshes += 1;
                 report_event(format!("购票 token 失效，重新准备（{refreshes}/{MAX_TOKEN_REFRESHES}）：{reason}"), false);
@@ -1153,10 +1165,13 @@ async fn prepare_token(
             }
             Some(Err(error)) => {
                 let reason = format!("准备购票失败：{error}");
-                let mut delay = PREPARE_INTERVAL.max(error.retry_after().unwrap_or_default());
+                let retry_after = error.retry_after().unwrap_or_default();
+                let mut delay = PREPARE_INTERVAL.max(retry_after);
                 match error {
                     PurchaseApiError::Business { code, .. } => match business_rejection(code) {
-                        Some(BusinessRejection::Target) => return Err(TargetExit::NextTarget(reason)),
+                        Some(BusinessRejection::Target) => {
+                            return Err(TargetExit::NextTarget { reason, delay: retry_after });
+                        }
                         Some(BusinessRejection::Task) => return Err(TargetExit::Finished(TaskOutcome::Ended(reason))),
                         Some(BusinessRejection::Retry(wait)) => delay = delay.max(wait),
                         _ => {}
@@ -1172,7 +1187,10 @@ async fn prepare_token(
         };
         failures += 1;
         if failures == limit {
-            return Err(TargetExit::NextTarget(format!("准备购票已达上限（{limit} 次）：{reason}")));
+            return Err(TargetExit::NextTarget {
+                reason: format!("准备购票已达上限（{limit} 次）：{reason}"),
+                delay,
+            });
         }
         report_event(reason, true);
         if !wait_running(cancel, delay).await {
@@ -1196,18 +1214,19 @@ async fn confirm_parameters(
             Some(Ok(confirmation)) => return Ok(confirmation),
             Some(Err(error)) => {
                 let reason = format!("确认订单参数失败：{error}");
-                let mut delay = CONFIRM_INTERVAL.max(error.retry_after().unwrap_or_default());
+                let retry_after = error.retry_after().unwrap_or_default();
+                let mut delay = CONFIRM_INTERVAL.max(retry_after);
                 match error {
                     PurchaseApiError::Business { code, .. } => match business_rejection(code) {
                         Some(BusinessRejection::RefreshToken) => return Err(PreparedExit::RefreshToken { reason, delay }),
                         Some(BusinessRejection::Task) => return Err(PreparedExit::Target(TargetExit::Finished(TaskOutcome::Ended(reason)))),
                         Some(BusinessRejection::Target) | None => {
-                            return Err(PreparedExit::Target(TargetExit::NextTarget(reason)));
+                            return Err(PreparedExit::Target(TargetExit::NextTarget { reason, delay: retry_after }));
                         }
                         Some(BusinessRejection::Retry(wait)) => delay = delay.max(wait),
                     },
                     PurchaseApiError::InvalidParameter(_) => {
-                        return Err(PreparedExit::Target(TargetExit::NextTarget(reason)));
+                        return Err(PreparedExit::Target(TargetExit::NextTarget { reason, delay: Duration::ZERO }));
                     }
                     _ => {}
                 }
@@ -1217,9 +1236,10 @@ async fn confirm_parameters(
         };
         failures += 1;
         if failures == MAX_CONFIRM_ATTEMPTS {
-            return Err(PreparedExit::Target(TargetExit::NextTarget(format!(
-                "确认订单参数已达上限（{MAX_CONFIRM_ATTEMPTS} 次）：{reason}"
-            ))));
+            return Err(PreparedExit::Target(TargetExit::NextTarget {
+                reason: format!("确认订单参数已达上限（{MAX_CONFIRM_ATTEMPTS} 次）：{reason}"),
+                delay,
+            }));
         }
         report_event(reason, true);
         if !wait_running(cancel, delay).await {
@@ -1228,8 +1248,8 @@ async fn confirm_parameters(
     }
 }
 
-fn create_limit_reached(limit: u32) -> TargetExit {
-    TargetExit::NextTarget(format!("创建订单已达上限（{limit} 次）"))
+fn create_limit_reached(limit: u32, reason: &str, delay: Duration) -> TargetExit {
+    TargetExit::NextTarget { reason: format!("创建订单已达上限（{limit} 次）：{reason}"), delay }
 }
 
 async fn wait_for_stock(
@@ -1245,17 +1265,20 @@ async fn wait_for_stock(
         let result = while_running(cancel, check).await
             .ok_or(TargetExit::Finished(TaskOutcome::Stopped))?;
         checks += 1;
-        let (status, delay) = match result {
-            Ok(status) => (status, interval),
+        let (status, retry_after) = match result {
+            Ok(status) => (status, None),
             Err(error) => {
                 log::warn!("查询库存失败：{error}");
-                (StockStatus::Unknown, interval.max(error.retry_after().unwrap_or_default()))
+                (StockStatus::Unknown, error.retry_after())
             }
         };
         match status {
             StockStatus::Available => return Ok(()),
             StockStatus::Unavailable if checks == MAX_STOCK_CHECKS => {
-                return Err(TargetExit::NextTarget(format!("库存等待到限（{MAX_STOCK_CHECKS} 次）")));
+                return Err(TargetExit::NextTarget {
+                    reason: format!("库存等待到限（{MAX_STOCK_CHECKS} 次）"),
+                    delay: Duration::ZERO,
+                });
             }
             StockStatus::Unavailable => {
                 consecutive_unknown = 0;
@@ -1267,12 +1290,17 @@ async fn wait_for_stock(
                     let message = format!("库存未知（已查询 {checks} 次），继续尝试创建订单");
                     log::warn!("{message}");
                     report_event(message, true);
+                    if let Some(delay) = retry_after {
+                        if !wait_running(cancel, delay).await {
+                            return Err(TargetExit::Finished(TaskOutcome::Stopped));
+                        }
+                    }
                     return Ok(());
                 }
                 report_event(format!("库存未知（{checks}/{MAX_STOCK_CHECKS}）"), true);
             }
         }
-        if !wait_running(cancel, delay).await {
+        if !wait_running(cancel, interval.max(retry_after.unwrap_or_default())).await {
             return Err(TargetExit::Finished(TaskOutcome::Stopped));
         }
     }
@@ -1304,9 +1332,7 @@ async fn create_on_target(
         if *cancel.borrow() {
             return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped));
         }
-        if *attempts == limit {
-            return PreparedExit::Target(create_limit_reached(limit));
-        }
+        assert!(*attempts < limit, "创建请求超过票档预算");
         report_phase(GrabPhase::Grabbing);
         let attempts_before = *attempts;
         let create = create_order(
@@ -1331,6 +1357,13 @@ async fn create_on_target(
                 let outcome = check_existing_order(&request.cookie_manager, order, cancel).await;
                 return PreparedExit::Target(TargetExit::Finished(outcome));
             }
+            Ok(Err(PurchaseApiError::UnconfirmedOrder { order: created, reason })) => {
+                order.order_id = created.order_id;
+                order.query_token = created.query_token;
+                report(|entry| entry.info_seed.order = Some(order));
+                let outcome = unresolved_order(cancel, format!("创建订单结果待核对：{reason}"));
+                return PreparedExit::Target(TargetExit::Finished(outcome));
+            }
             Ok(Err(PurchaseApiError::Cancelled)) => return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped)),
             Ok(Err(error)) => error,
             Err(_) => {
@@ -1344,7 +1377,8 @@ async fn create_on_target(
             }
         };
         let reason = format!("创建订单失败：{error}");
-        let delay = create_interval.max(error.retry_after().unwrap_or_default());
+        let retry_after = error.retry_after().unwrap_or_default();
+        let delay = create_interval.max(retry_after);
         match error {
             PurchaseApiError::Business { code, .. } => {
                 let Some(rejection) = business_rejection(code) else {
@@ -1357,12 +1391,13 @@ async fn create_on_target(
                 }
                 match rejection {
                     BusinessRejection::Retry(wait) => {
-                        report_event(reason, false);
-                        if *attempts == limit && request.grab_mode != 2 {
-                            return PreparedExit::Target(create_limit_reached(limit));
+                        let delay = delay.max(wait);
+                        if *attempts == limit {
+                            return PreparedExit::Target(create_limit_reached(limit, &reason, delay));
                         }
+                        report_event(reason, false);
                         // 库存查询所花的时间也计入本次创建退避。
-                        let retry = tokio::time::sleep(delay.max(wait));
+                        let retry = tokio::time::sleep(delay);
                         if request.grab_mode != 2 && config.stock_check && code == INSUFFICIENT_STOCK {
                             if let Err(exit) = wait_for_stock(request, target, cancel).await {
                                 return PreparedExit::Target(exit);
@@ -1373,7 +1408,9 @@ async fn create_on_target(
                         }
                     }
                     BusinessRejection::RefreshToken => return PreparedExit::RefreshToken { reason, delay },
-                    BusinessRejection::Target => return PreparedExit::Target(TargetExit::NextTarget(reason)),
+                    BusinessRejection::Target => {
+                        return PreparedExit::Target(TargetExit::NextTarget { reason, delay: retry_after });
+                    }
                     BusinessRejection::Task => {
                         return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Ended(reason)));
                     }
@@ -1409,7 +1446,7 @@ async fn check_existing_order(
         return TaskOutcome::Stopped;
     }
     let Some(query_token) = order.query_token.clone() else {
-        return unresolved_order(cancel, "订单已受理，缺少查询标识，请核对订单".to_string());
+        return unresolved_order(cancel, "创建响应缺少查询标识，请核对原账号订单".to_string());
     };
     report_phase(GrabPhase::CheckingOrder);
     let mut checks = 0;
@@ -1430,19 +1467,20 @@ async fn check_existing_order(
                 if order.order_id.is_none() {
                     order.order_id = checked.order_id;
                 }
-                if let Some(payment) = checked.pay_result {
-                    order.state = OrderState::AwaitingPayment(payment);
-                    report(|entry| {
-                        entry.info_seed.order = Some(order);
-                        entry.info_seed.last_event = Some(event("订单已确认，等待付款", false));
-                    });
-                    return TaskOutcome::Succeeded;
-                }
+                let reason = match checked.pay_result {
+                    Ok(Some(payment)) => {
+                        order.state = OrderState::AwaitingPayment(payment);
+                        report(|entry| {
+                            entry.info_seed.order = Some(order);
+                            entry.info_seed.last_event = Some(event("订单已确认，等待付款", false));
+                        });
+                        return TaskOutcome::Succeeded;
+                    }
+                    Ok(None) => "等待订单支付信息".to_string(),
+                    Err(error) => format!("查询订单暂未确认：{error}"),
+                };
                 report(|entry| entry.info_seed.order = Some(order.clone()));
-                (
-                    "等待订单支付信息".to_string(),
-                    ORDER_CHECK_INTERVAL.max(checked.retry_after.unwrap_or_default()),
-                )
+                (reason, ORDER_CHECK_INTERVAL.max(checked.retry_after.unwrap_or_default()))
             }
             Some(Err(PurchaseApiError::Cancelled)) | None => return TaskOutcome::Stopped,
             Some(Err(error)) => (
@@ -1832,15 +1870,20 @@ mod tests {
     #[tokio::test]
     async fn stock_wait_falls_back_after_three_consecutive_unknown_results() {
         let config = CustomConfig { stock_check: true, stock_interval_ms: 1, ..CustomConfig::new() };
+        let retry_after = Duration::from_millis(800);
         let trace = Fixture::with_config(1, &config).run(vec![
             prepare("test"), confirm(0), rejection(Endpoint::Create, INSUFFICIENT_STOCK),
             (Endpoint::Stock, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)), stock(99), stock(2),
-            stock(99), (Endpoint::Stock, Reply::Raw(b"{")), stock(99),
+            stock(99), (Endpoint::Stock, Reply::Raw(b"{")),
+            (Endpoint::Stock, Reply::Http(StatusCode::TOO_MANY_REQUESTS, Some(retry_after))),
             created(Some(75), Some("query")), payable(Some(75)),
         ]).await;
         assert_eq!(requests(&trace, Endpoint::Stock).count(), 6);
         assert_eq!(trace.finished.info.attempts, 2);
         assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        let last_check = requests(&trace, Endpoint::Stock).last().unwrap();
+        let retry = requests(&trace, Endpoint::Create).last().unwrap();
+        assert!(retry.at - last_check.at >= retry_after);
     }
 
     #[tokio::test]
@@ -1917,14 +1960,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_respects_retry_after_when_last_create_invalidates_token() {
+        let config = CustomConfig { create_interval_ms: 1, ..CustomConfig::new() };
+        let retry_after = Duration::from_millis(400);
+        let mut responses = vec![
+            (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[31, 32])}))),
+            prepare("first-sku"), confirm(0),
+        ];
+        responses.extend((0..29).map(|_| rejection(Endpoint::Create, 211)));
+        responses.extend([
+            (Endpoint::Create, Reply::JsonWithRetryAfter(json!({"errno": 900002}), retry_after)),
+            prepare("next-sku"), confirm(0), created(Some(76), Some("query")), payable(Some(76)),
+        ]);
+        let trace = Fixture::with_config(2, &config).run(responses).await;
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        assert_eq!(trace.finished.info.attempts, 31);
+        let last_create = requests(&trace, Endpoint::Create).nth(29).unwrap();
+        let prepares: Vec<_> = requests(&trace, Endpoint::Prepare).collect();
+        assert_eq!(prepares.len(), 2);
+        assert_amount_and_target(prepares[1], 32, None);
+        assert!(prepares[1].at - last_create.at >= retry_after);
+    }
+
+    #[tokio::test]
     async fn monitoring_skips_cached_and_excluded_candidates_and_waits_between_live_scans() {
         let interval = Duration::from_millis(100);
+        let retry_after = Duration::from_millis(400);
         let config = CustomConfig { stock_interval_ms: interval.as_millis() as u64, ..CustomConfig::new() };
         let mut fixture = Fixture::with_config(2, &config);
         fixture.cached_project = Some(json!({"errno": 0, "data": project_data(&[31])}));
         fixture.request.skip_words = Some(vec!["票档 33".into()]);
         let trace = tokio::time::timeout(Duration::from_secs(3), fixture.run(vec![
-            (Endpoint::Project, Reply::Json(json!({"errno": 4321, "data": project_data(&[31])}))),
+            (Endpoint::Project, Reply::JsonWithRetryAfter(
+                json!({"errno": 4321, "data": project_data(&[31])}), retry_after,
+            )),
             (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[33])}))),
             (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[32])}))),
             prepare("live"), confirm(0), created(Some(75), Some("query")), payable(Some(75)),
@@ -1934,10 +2003,8 @@ mod tests {
         assert_eq!(trace.finished.info.rounds, 1);
         let scans: Vec<_> = requests(&trace, Endpoint::Project).collect();
         assert_eq!(scans.len(), 3);
-        for pair in scans.windows(2) {
-            let gap = pair[1].at - pair[0].at;
-            assert!((interval..Duration::from_secs(1)).contains(&gap));
-        }
+        assert!(scans[1].at - scans[0].at >= retry_after);
+        assert!(scans[2].at - scans[1].at >= interval);
         let creates: Vec<_> = requests(&trace, Endpoint::Create).collect();
         assert_eq!(creates.len(), 1);
         assert_amount_and_target(creates[0], 32, Some(0));
@@ -1964,6 +2031,43 @@ mod tests {
             assert!(matches!(&order.state, OrderState::PendingConfirmation));
             assert!(trace.notices.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_create_with_order_id_keeps_identifiers_without_recreating_or_querying() {
+        let trace = Fixture::new(1).run(vec![
+            prepare("test"), confirm(0),
+            (Endpoint::Create, Reply::Json(json!({
+                "errno": 100079, "msg": "已有待付款订单",
+                "data": {"orderId": 75, "token": "query"}
+            }))),
+        ]).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::AwaitingConfirmation(reason) if reason.contains("100079")));
+        assert_eq!(trace.finished.info.attempts, 1);
+        assert_eq!(requests(&trace, Endpoint::Check).count(), 0);
+        let order = trace.finished.info.order.as_ref().unwrap();
+        assert!(matches!(order.state, OrderState::PendingConfirmation));
+        assert_eq!(order.order_id.as_deref(), Some("75"));
+        assert_eq!(order.query_token.as_deref(), Some("query"));
+    }
+
+    #[tokio::test]
+    async fn malformed_payment_keeps_the_learned_order_id_for_later_queries() {
+        let trace = Fixture::new(1).run(vec![
+            prepare("test"), confirm(0), created(None, Some("query")),
+            (Endpoint::Check, Reply::Json(json!({
+                "errno": 0,
+                "data": {"orderId": 75, "payParam": {"sign": false, "code_url": "https://payment.invalid/"}}
+            }))),
+            payable(Some(76)), payable(Some(75)),
+        ]).await;
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        assert_eq!(trace.finished.info.attempts, 1);
+        let checks: Vec<_> = requests(&trace, Endpoint::Check).collect();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(query(checks[0], "orderId"), None);
+        assert!(checks[1..].iter().all(|check| query(check, "orderId") == Some("75")));
+        assert_eq!(trace.finished.info.order.unwrap().order_id.as_deref(), Some("75"));
     }
 
     #[tokio::test]
@@ -2056,11 +2160,13 @@ mod tests {
         assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("数量")));
         assert!(trace.requests.is_empty());
 
-        let mut fixture = Fixture::new(2);
-        fixture.request.project_id = "0".into();
-        let trace = fixture.run(Vec::new()).await;
-        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("项目 ID")));
-        assert!(trace.requests.is_empty());
+        for project_id in ["0", "2147483648"] {
+            let mut fixture = Fixture::new(2);
+            fixture.request.project_id = project_id.into();
+            let trace = fixture.run(Vec::new()).await;
+            assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("项目 ID")));
+            assert!(trace.requests.is_empty());
+        }
     }
 
     fn hold(reply: Reply) -> (Reply, Arc<Notify>, Arc<Notify>) {
@@ -2068,6 +2174,44 @@ mod tests {
         let release = Arc::new(Notify::new());
         let reply = Reply::Wait { entered: entered.clone(), release: release.clone(), reply: Box::new(reply) };
         (reply, entered, release)
+    }
+
+    #[test]
+    fn cancelling_queued_grab_before_worker_subscription_sends_no_purchase_requests() {
+        let (task_sender, mut queued) = mpsc::channel(1);
+        let (_result_sender, result_receiver) = mpsc::channel(1);
+        let mut manager = TaskManagerImpl {
+            task_sender,
+            result_receiver,
+            running_tasks: HashMap::new(),
+            grab_registry: Arc::new(Mutex::new(HashMap::new())),
+            grab_finished: Arc::new(Mutex::new(Vec::new())),
+            seq_counter: Arc::new(AtomicU64::new(0)),
+            runtime: Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()),
+            _worker_thread: None,
+        };
+        let task_id = manager.submit_task(TaskRequest::GrabTicketRequest(Fixture::new(1).request)).unwrap();
+        manager.cancel_task(&task_id).unwrap();
+        assert!(matches!(manager.get_task_status(&task_id), Some(TaskStatus::Cancelling)));
+
+        // 保持 worker 尚未接收，直到提交方完成停止申请。
+        let TaskMessage::SubmitTask((queued_id, TaskRequest::GrabTicketRequest(request))) = queued.try_recv().unwrap() else {
+            panic!("应收到购票任务");
+        };
+        assert_eq!(queued_id, task_id);
+        let guard = GrabRegistryGuard {
+            registry: manager.grab_registry.clone(),
+            finished: manager.grab_finished.clone(),
+            task_id,
+        };
+        let (_, requests) = manager.runtime.block_on(with_responses([], run_registered_grab_task(guard, request)));
+        assert!(requests.is_empty());
+        assert!(manager.list_running_tasks().is_empty());
+        let finished = manager.take_finished_tasks();
+        assert_eq!(finished.len(), 1);
+        assert!(matches!(finished[0].outcome, TaskOutcome::Stopped));
+        assert_eq!(finished[0].info.attempts, 0);
+        assert!(finished[0].info.order.is_none());
     }
 
     #[tokio::test]

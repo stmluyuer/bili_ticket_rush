@@ -69,7 +69,19 @@ impl Config{
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let encoded_iv = BASE64.encode(&iv);  
         let encoded_encrypted = BASE64.encode(&encrypted);
-        fs::write("./config", encoded_iv+"%" + &*encoded_encrypted)
+        // 先完整写入同目录临时文件，失败时保留上一次可加载的配置。
+        let pending = format!("./.config-{}.tmp", uuid::Uuid::new_v4());
+        let result = (|| {
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&pending)?;
+            file.write_all((encoded_iv + "%" + &encoded_encrypted).as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&pending, "./config")
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&pending);
+        }
+        result
     }
 
 
@@ -502,5 +514,39 @@ mod tests {
     fn machine_key_is_16_bytes() {
         let key = gen_machine_id_bytes_128b();
         assert_eq!(key.len(), 16);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_replacement_failure_preserves_saved_values() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const CHILD: &str = "BILI_CONFIG_REPLACE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut config = Config::new();
+            config["custom_config"] = serde_json::to_value(CustomConfig::new()).unwrap();
+            config.save_config().unwrap();
+            let original = fs::read("config").unwrap();
+            // 允许读取和写入但不允许替换，真实触发提交临时文件失败。
+            let held = fs::OpenOptions::new().read(true).share_mode(3).open("config").unwrap();
+            config["custom_config"]["sale_delay_ms"] = 275.into();
+            assert!(config.save_config().is_err());
+            assert_eq!(fs::read("config").unwrap(), original);
+            assert_eq!(Config::load_config().unwrap()["custom_config"]["sale_delay_ms"], 0);
+            drop(held);
+            config.save_config().unwrap();
+            assert_eq!(Config::load_config().unwrap()["custom_config"]["sale_delay_ms"], 275);
+            assert_eq!(fs::read_dir(".").unwrap().count(), 1);
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bili-config-replace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let result = process::Command::new(std::env::current_exe().unwrap())
+            .current_dir(&dir)
+            .env(CHILD, "1")
+            .args(["--exact", "utils::tests::config_replacement_failure_preserves_saved_values"])
+            .output();
+        fs::remove_dir_all(&dir).unwrap();
+        let output = result.unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }
 }

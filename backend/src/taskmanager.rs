@@ -30,21 +30,132 @@ struct GrabTaskEntry {
     info_seed: RunningTaskInfo,
     start_time: std::time::Instant,
     cancel_flag: Arc<AtomicBool>,
+    outcome: Option<TaskOutcome>,
 }
 
 /// RAII 守卫：任务结束时（正常返回 / return / panic unwind）都会从注册表移除该任务，
 /// 避免 panic 路径下留下永久「运行中」的僵尸条目。用 `if let Ok` 规避锁中毒再次 panic。
+/// 移除时把最后快照转入已结束列表，供界面取走。
 struct GrabRegistryGuard {
     registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>>,
+    finished: Arc<Mutex<Vec<FinishedTaskInfo>>>,
     task_id: String,
 }
 
 impl Drop for GrabRegistryGuard {
     fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.remove(&self.task_id);
+        let entry = match self.registry.lock() {
+            Ok(mut registry) => registry.remove(&self.task_id),
+            Err(_) => None,
+        };
+        let Some(entry) = entry else { return };
+        let mut info = entry.info_seed;
+        info.elapsed_secs = entry.start_time.elapsed().as_secs();
+        let outcome = match entry.outcome {
+            Some(outcome) => outcome,
+            None if entry.cancel_flag.load(Ordering::Relaxed) => TaskOutcome::Stopped,
+            None => TaskOutcome::Ended(
+                info.last_event
+                    .as_ref()
+                    .map(|e| e.text.clone())
+                    .unwrap_or_else(|| "已结束".to_string()),
+            ),
+        };
+        if let Ok(mut finished) = self.finished.lock() {
+            finished.push(FinishedTaskInfo {
+                info,
+                outcome,
+                finished_at: SystemTime::now(),
+            });
         }
     }
+}
+
+// 抢票任务内的上报上下文：(注册表, task_id)。handle_grab_ticket / try_create_order
+// 都在该任务的 future 内被 await，因此无需逐层传参。
+tokio::task_local! {
+    static GRAB_CTX: (Arc<Mutex<HashMap<String, GrabTaskEntry>>>, String);
+}
+
+/// 修改当前抢票任务的注册表条目；不在抢票任务作用域内时什么也不做
+fn report(f: impl FnOnce(&mut GrabTaskEntry)) {
+    let _ = GRAB_CTX.try_with(|(registry, task_id)| {
+        let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = registry.get_mut(task_id) {
+            f(entry);
+        }
+    });
+}
+
+fn event(text: impl Into<String>, is_error: bool) -> TaskEvent {
+    TaskEvent {
+        text: text.into(),
+        is_error,
+        at: SystemTime::now(),
+    }
+}
+
+fn report_phase(phase: GrabPhase) {
+    report(|t| t.info_seed.phase = phase);
+}
+
+/// 下单接口返回错误码：计一次下单，记录事件；fatal 表示该分支会终止任务
+fn report_order_error(text: String, is_error: bool, fatal: bool) {
+    report(|t| {
+        t.info_seed.attempts += 1;
+        if fatal {
+            t.outcome = Some(TaskOutcome::Ended(text.clone()));
+        }
+        t.info_seed.last_event = Some(event(text, is_error));
+    });
+}
+
+/// 各模式“抢票流程结束”时补上结局；成功、致命错误已设过的不覆盖，
+/// 用户取消也会走到这里，留给守卫判为 Stopped
+fn report_flow_end() {
+    report(|t| {
+        if t.outcome.is_none() && !t.cancel_flag.load(Ordering::Relaxed) {
+            let text = t
+                .info_seed
+                .last_event
+                .as_ref()
+                .map(|e| e.text.clone())
+                .unwrap_or_else(|| "抢票流程结束".to_string());
+            t.outcome = Some(TaskOutcome::Ended(text));
+        }
+    });
+}
+
+/// 任务卡片上的“场次 · 票种 × 数量”
+fn grab_target(
+    mode: u8,
+    project_info: Option<&TicketInfo>,
+    screen_id: &str,
+    ticket_id: &str,
+    count: i16,
+) -> String {
+    if mode == 2 {
+        return format!("全部场次 · 捡漏 × {}", count);
+    }
+    project_info
+        .and_then(|p| {
+            p.screen_list
+                .iter()
+                .find(|s| s.id.map(|id| id.to_string()).as_deref() == Some(screen_id))
+        })
+        .and_then(|screen| {
+            let ticket = screen
+                .ticket_list
+                .iter()
+                .find(|t| t.id.map(|id| id.to_string()).as_deref() == Some(ticket_id))?;
+            Some(format!(
+                "{} · {} × {}",
+                screen.name.as_deref()?,
+                ticket.desc.as_deref()?,
+                count
+            ))
+        })
+        .unwrap_or_else(|| format!("场次 {} · 票种 {} × {}", screen_id, ticket_id, count))
 }
 
 pub struct TaskManagerImpl {
@@ -52,6 +163,7 @@ pub struct TaskManagerImpl {
     result_receiver: mpsc::Receiver<TaskResult>,
     running_tasks: HashMap<String, Task>, // 使用 Task 枚举
     grab_registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>>,
+    grab_finished: Arc<Mutex<Vec<FinishedTaskInfo>>>,
     seq_counter: Arc<AtomicU64>,
     runtime: Arc<Runtime>,
     _worker_thread: Option<thread::JoinHandle<()>>,
@@ -76,12 +188,15 @@ impl TaskManager for TaskManagerImpl {
         let grab_registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let seq_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let grab_finished: Arc<Mutex<Vec<FinishedTaskInfo>>> = Arc::new(Mutex::new(Vec::new()));
+        let grab_finished_worker = grab_finished.clone();
         let grab_registry_worker = grab_registry.clone();
         let seq_counter_worker = seq_counter.clone();
 
         // 启动工作线程
         let worker = thread::spawn(move || {
             rt.block_on(async {
+                let mut qr_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
                 while let Some(msg) = task_rx.recv().await {
                     match msg {
         TaskMessage::SubmitTask((task_id, request)) => {
@@ -91,7 +206,9 @@ impl TaskManager for TaskManagerImpl {
                             match request {
                                 
                                 TaskRequest::QrCodeLoginRequest(qrcode_req) => {
-                                    tokio::spawn(async move {
+                                    qr_tasks.retain(|_, handle| !handle.is_finished());
+                                    let qr_task_id = task_id.clone();
+                                    let qr_task = tokio::spawn(async move {
                                         // 二维码登录逻辑
                                         let status = poll_qrcode_login(&qrcode_req.qrcode_key,qrcode_req.user_agent.as_deref()).await;
                                         
@@ -113,6 +230,7 @@ impl TaskManager for TaskManagerImpl {
                                         
                                         let _ = result_tx.send(task_result).await;
                                     });
+                                    qr_tasks.insert(qr_task_id, qr_task);
                                 }
                                 TaskRequest::LoginSmsRequest(login_sms_req) => {
                                     let phone = login_sms_req.phone.clone();
@@ -447,29 +565,42 @@ impl TaskManager for TaskManagerImpl {
                                                 grab_mode: mode,
                                                 status: TaskStatus::Running,
                                                 elapsed_secs: 0,
+                                                phase: GrabPhase::Preparing,
+                                                sale_at: None,
+                                                attempts: 0,
+                                                rounds: 0,
+                                                last_event: None,
+                                                target: grab_target(mode, project_info.as_ref(), &screen_id, &ticket_id, count),
+                                                project_id: project_id.clone(),
+                                                ticket_id: ticket_id.clone(),
                                             },
                                             start_time: std::time::Instant::now(),
                                             cancel_flag: cancel_flag.clone(),
+                                            outcome: None,
                                         };
                                         if let Ok(mut reg) = grab_registry_worker.lock() {
                                             reg.insert(task_id.clone(), entry);
                                         }
                                     }
                                     let grab_registry_cleanup = grab_registry_worker.clone();
+                                    let grab_finished_cleanup = grab_finished_worker.clone();
                                     let task_id_cleanup = task_id.clone();
+                                    let grab_ctx = (grab_registry_worker.clone(), task_id.clone());
                                     tokio::spawn(async move{
                                     // 守卫在 spawn 内最外层创建，任务以任何方式结束（含 panic）时都会清理注册表
                                     let _registry_guard = GrabRegistryGuard {
                                         registry: grab_registry_cleanup,
+                                        finished: grab_finished_cleanup,
                                         task_id: task_id_cleanup,
                                     };
-                                    TASK_LABEL.scope(task_label, async move {
+                                    GRAB_CTX.scope(grab_ctx, TASK_LABEL.scope(task_label, async move {
                                         log::debug!("开始分析抢票任务：{}",task_id);
                                        
                                         match mode {
                                             0 => {
                                                 log::debug!("定时抢票模式");
                                                 //log::debug!("开售时间：{}",project_info.clone().unwrap().sale_begin);
+                                                let sale_begin = project_info.as_ref().and_then(|p| p.sale_begin);
                                                 let mut countdown = match get_countdown(cookie_manager.clone(),project_info).await{
                                                     Ok(countdown) => countdown,
                                                     Err(e) => {
@@ -481,6 +612,13 @@ impl TaskManager for TaskManagerImpl {
                                                 //log::debug!("获取倒计时成功：{}",countdown);
                                                 if countdown > 0.0{
                                                     log::info!("距离抢票时间还有{}秒",countdown);
+                                                    let sale_at = sale_begin.unwrap_or_else(|| {
+                                                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + countdown as i64
+                                                    });
+                                                    report(|t| {
+                                                        t.info_seed.phase = GrabPhase::WaitingSale;
+                                                        t.info_seed.sale_at = Some(sale_at);
+                                                    });
                                                     loop{
                                                         if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                         if countdown <= 20.0 {
@@ -507,6 +645,7 @@ impl TaskManager for TaskManagerImpl {
                                                     }
                                                 }
                                                 log::info!("开始抢票！");
+                                                report_phase(GrabPhase::Grabbing);
                                                 let mut token_retry_count = 0;
                                                 const MAX_TOKEN_RETRY: i8 = 5;
                                                 let mut confirm_order_retry_count = 0;
@@ -544,6 +683,7 @@ impl TaskManager for TaskManagerImpl {
                                                                 ).await ;
                                                                 if success && !retry_limit {
                                                                     log::info!("抢票流程结束，退出定时抢票模式");
+                                                                    report_flow_end();
                                                                     break; //成功或致命错误，跳出循环
                                                                 }
             
@@ -574,6 +714,7 @@ impl TaskManager for TaskManagerImpl {
                                                                 //需要处理验证码
                                                                 if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 log::warn!("需要验证码，开始处理验证码...");
+                                                                report_phase(GrabPhase::Captcha);
                                                                 match handle_risk_verification(
                                                                     cookie_manager.clone(), 
                                                                     risk_param,
@@ -584,10 +725,12 @@ impl TaskManager for TaskManagerImpl {
                                                                     Ok(()) => {
                                                                         //验证码处理成功，继续抢票
                                                                         log::info!("验证码处理成功！");
+                                                                        report_phase(GrabPhase::Grabbing);
                                                                     }
                                                                     Err(e) => {
                                                                         //验证码失败
                                                                         log::error!("验证码处理失败: {}", e);
+                                                                        report(|t| t.info_seed.last_event = Some(event(format!("验证码处理失败: {}", e), true)));
                                                                         token_retry_count +=1;
                                                                         if token_retry_count >= MAX_TOKEN_RETRY {
                                                                             let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
@@ -645,6 +788,7 @@ impl TaskManager for TaskManagerImpl {
                                             } 
                                             1 => {
                                                 log::debug!("直接抢票模式");
+                                                report_phase(GrabPhase::Grabbing);
                                                 let mut token_retry_count = 0;
                                                 const MAX_TOKEN_RETRY: i8 = 10;
                                                 let mut confirm_order_retry_count = 0;
@@ -683,6 +827,7 @@ impl TaskManager for TaskManagerImpl {
                                                                  ).await ;
                                                                 if success {
                                                                     log::info!("抢票流程结束，退出捡漏模式");
+                                                                    report_flow_end();
                                                                     
                                                                     break; //成功或致命错误，跳出循环
                                                                 }
@@ -714,6 +859,7 @@ impl TaskManager for TaskManagerImpl {
                                                                 //需要处理验证码
                                                                 if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 log::warn!("需要验证码，开始处理验证码...");
+                                                                report_phase(GrabPhase::Captcha);
                                                                 match handle_risk_verification(
                                                                     cookie_manager.clone(), 
                                                                     risk_param,
@@ -724,10 +870,12 @@ impl TaskManager for TaskManagerImpl {
                                                                     Ok(()) => {
                                                                         //验证码处理成功，继续抢票
                                                                         log::info!("验证码处理成功！");
+                                                                        report_phase(GrabPhase::Grabbing);
                                                                     }
                                                                     Err(e) => {
                                                                         //验证码失败
                                                                         log::error!("验证码处理失败: {}", e);
+                                                                        report(|t| t.info_seed.last_event = Some(event(format!("验证码处理失败: {}", e), true)));
                                                                         token_retry_count +=1;
                                                                         if token_retry_count >= MAX_TOKEN_RETRY {
                                                                             let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
@@ -844,6 +992,18 @@ impl TaskManager for TaskManagerImpl {
                                                             }
                                                             
                                                             log::info!("当前{} {}票种可售，开始抢票！", ticket_data.screen_name.as_deref().unwrap_or("未知场次"), ticket_data.desc.as_deref().unwrap_or("未知票种"));
+                                                            // 场次级日志每轮都会对可点场次触发（票种可能已售罄），只在票种级上报
+                                                            report(|t| {
+                                                                t.info_seed.phase = GrabPhase::Grabbing;
+                                                                t.info_seed.last_event = Some(event(
+                                                                    format!(
+                                                                        "发现余票：{} {}",
+                                                                        ticket_data.screen_name.as_deref().unwrap_or("未知场次"),
+                                                                        ticket_data.desc.as_deref().unwrap_or("未知票种")
+                                                                    ),
+                                                                    false,
+                                                                ));
+                                                            });
                                                             local_grab_request.ticket_id = ticket_data.id.unwrap_or(0).to_string();
                                                             local_grab_request.biliticket.select_ticket_id = Some(ticket_data.id.unwrap_or(0).to_string());
                                                             cpdd = Arc::new(Mutex::new(CTokenGenerator::new(
@@ -890,11 +1050,13 @@ impl TaskManager for TaskManagerImpl {
                                                                          ).await ;
                                                                 if success {
                                                                     log::info!("抢票流程结束，退出捡漏模式");
+                                                                    report_flow_end();
                                                                     
                                                                     break 'main_loop;
                                                                 }
                                                                 if retry_limit {
                                                                     log::info!("该票种已达到最大重试次数，恢复捡漏模式，尝试其他票种");
+                                                                    report_phase(GrabPhase::Monitoring);
                                                                     break 'screen_loop;
                                                                 }
                                                                 
@@ -913,6 +1075,7 @@ impl TaskManager for TaskManagerImpl {
                                                                 //需要处理验证码
                                                                 if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 log::warn!("需要验证码，开始处理验证码...");
+                                                                report_phase(GrabPhase::Captcha);
                                                                 match handle_risk_verification(
                                                                     cookie_manager.clone(), 
                                                                     risk_param,
@@ -923,10 +1086,12 @@ impl TaskManager for TaskManagerImpl {
                                                                     Ok(()) => {
                                                                         //验证码处理成功，继续抢票
                                                                         log::info!("验证码处理成功！");
+                                                                        report_phase(GrabPhase::Monitoring);
                                                                     }
                                                                     Err(e) => {
                                                                         //验证码失败
                                                                         log::error!("验证码处理失败: {}", e);
+                                                                        report(|t| t.info_seed.last_event = Some(event(format!("验证码处理失败: {}", e), true)));
                                                                         token_retry_count +=1;
                                                                         if token_retry_count >= MAX_TOKEN_RETRY {
                                                                             let task_result = TaskResult::GrabTicketResult(GrabTicketResult{
@@ -983,6 +1148,12 @@ impl TaskManager for TaskManagerImpl {
                                                     
                                                     // 本轮所有场次和票种都检查完毕，休息一秒后继续下一轮
                                                     log::info!("所有场次和票种检查完毕，等待2秒后重新检查");
+                                                    report(|t| {
+                                                        t.info_seed.phase = GrabPhase::Monitoring;
+                                                        t.info_seed.rounds += 1;
+                                                        let rounds = t.info_seed.rounds;
+                                                        t.info_seed.last_event = Some(event(format!("第 {} 轮检查完毕，暂无余票", rounds), false));
+                                                    });
                                                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                                                 }
                                                 
@@ -992,14 +1163,16 @@ impl TaskManager for TaskManagerImpl {
                                                 log::error!("未知模式");
                                             }
                                         }
-                                    }).await; // TASK_LABEL.scope end
+                                    })).await; // GRAB_CTX / TASK_LABEL.scope end
                                     // 任务结束后由 _registry_guard 的 Drop 自动从注册表移除
                                     });
                                 }
                             }
                         },
-                        TaskMessage::CancelTask(_task_id) => {
-                            // 取消任务逻辑
+                        TaskMessage::CancelTask(task_id) => {
+                            if let Some(handle) = qr_tasks.remove(&task_id) {
+                                handle.abort();
+                            }
                         },
                         TaskMessage::Shutdown => break,
                     }
@@ -1012,6 +1185,7 @@ impl TaskManager for TaskManagerImpl {
             result_receiver: result_rx,
             running_tasks: HashMap::new(),
             grab_registry,
+            grab_finished,
             seq_counter,
             runtime: runtime,
             _worker_thread: Some(worker),
@@ -1157,6 +1331,14 @@ impl TaskManager for TaskManagerImpl {
     }
     
     fn cancel_task(&mut self, task_id: &str) -> Result<(), String> {
+        if matches!(self.running_tasks.get(task_id), Some(Task::QrCodeLoginTask(_))) {
+            // 提交和取消共用队列，立即关闭时也会先注册轮询句柄再终止。
+            self.task_sender
+                .blocking_send(TaskMessage::CancelTask(task_id.to_string()))
+                .map_err(|e| format!("无法取消任务: {}", e))?;
+            self.running_tasks.remove(task_id);
+            return Ok(());
+        }
         let registry = self
             .grab_registry
             .lock()
@@ -1204,7 +1386,15 @@ impl TaskManager for TaskManagerImpl {
         tasks.sort_by_key(|t| t.seq);
         tasks
     }
-    
+
+    fn take_finished_tasks(&mut self) -> Vec<FinishedTaskInfo> {
+        let mut finished = self
+            .grab_finished
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *finished)
+    }
+
     fn shutdown(&mut self) {
         let _ = self.task_sender.blocking_send(TaskMessage::Shutdown);
         if let Some(handle) = self._worker_thread.take() {
@@ -1312,6 +1502,7 @@ async fn try_create_order(
         ).await {
             Ok(order_result) => {
                 log::info!("下单成功！订单信息{:?}", order_result);
+                report(|t| t.info_seed.attempts += 1);
                 let empty_json = json!({});
                 let order_data = order_result.get("data").unwrap_or(&empty_json);
                 
@@ -1358,7 +1549,12 @@ async fn try_create_order(
 
                 });
                 let _ = result_tx.send(task_result.clone()).await;
-                
+                // 放在假票检测通过之后：前面的“下单成功！”日志之后仍可能 continue 重试
+                report(|t| {
+                    t.info_seed.last_event = Some(event("下单成功，等待付款", false));
+                    t.outcome = Some(TaskOutcome::Succeeded);
+                });
+
                 //修复由于挂在后台egui不运行导致任务管理器不加载导致不推送
                 let jump_url = Some(format!("bilibili://mall/web?url=https://mall.bilibili.com/neul-next/ticket/orderDetail.html?order_id={}", order_id.to_string()));
                 let pay_url = pay_result.code_url.clone();
@@ -1377,72 +1573,89 @@ async fn try_create_order(
                     100001 | 429 | 900001=> 
                     {
                         log::info!("b站限速，正常现象");
+                        report_order_error("B 站限速，继续重试".to_string(), false, false);
                         tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.3)).await; 
 
                 },
                     100009 => { 
                         log::info!("当前票种库存不足");
+                        report_order_error("库存不足（100009）".to_string(), false, false);
                         //再次降速，不给b站服务器带来压力
                         tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.6)).await; 
 
                     },
                     211 => {
                         log::info!("很遗憾，差一点点抢到票，继续加油吧！");
+                        report_order_error("差一点抢到（211）".to_string(), false, false);
                     }
                     
                     //需要暂停的情况
                     3 => {
                         log::info!("抢票速度过快，即将被硬控5秒");
                         log::info!("暂停4.8秒");
+                        report_order_error("请求过快，暂停 5 秒".to_string(), false, false);
                         tokio::time::sleep(tokio::time::Duration::from_secs_f32(4.8)).await;
                     },
                     
                     //需要重新获取token的情况
                     100041 | 100050 | 900002=> {
                         log::info!("token失效，即将重新获取token");
+                        report_order_error("token 失效，重新获取".to_string(), false, false);
                         return Some((true,true)); // 需要重新获取token
                     },
                     
                     //需要终止抢票的致命错误
                     100017 | 100016 => {
                         log::info!("当前项目/类型/场次已停售");
+                        report_order_error("项目或票种已停售".to_string(), true, true);
                         return Some((true,false));
                     },
                     1 => {
                         log::error!("超人 请慢一点，这是仅限1人抢票的项目，或抢票格式有误，请重新提交任务");
+                        report_order_error("仅限 1 人或格式有误，请重新提交任务".to_string(), true, true);
                         return Some((true,false));
                     }
                     83000004 => {
                         log::error!("没有配置购票人信息！请重新配置");
+                        report_order_error("没有配置购票人".to_string(), true, true);
                         return Some((true,false));
                     },
                     100079 | 100003  => {
                         log::error!("购票人存在待付款订单，请前往支付或取消后重新下单");
+                        report_order_error("这个购票人有待付款订单，请先付款或取消后再试".to_string(), true, true);
                         return Some((true,false));
                     },
                     100039 => {
                         log::error!("活动收摊啦,下次要快点哦");
+                        report_order_error("活动收摊啦,下次要快点哦（100039）".to_string(), true, true);
                         return Some((true,false));
                     }
                     
                     209001 => {
                         log::error!("当前项目只能选择一个购票人！不支持多选，请重新提交任务");
+                        report_order_error("当前项目只能选择一个购票人！不支持多选，请重新提交任务（209001）".to_string(), true, true);
                         return Some((true,false));
                     }
                     737 => {
                         log::error!("B站传了一个NUll回来，请看一下上一行的message提示信息，自行决定是否继续，如果取消请关闭重新打开该应用");
+                        report_order_error("B站传了一个NUll回来，请看一下上一行的message提示信息，自行决定是否继续，如果取消请关闭重新打开该应用（737）".to_string(), true, false);
                     }
                     
                     999 => {
-                        log::error!("程序内部错误！传参错误")
+                        log::error!("程序内部错误！传参错误");
+                        report_order_error("程序内部错误！传参错误（999）".to_string(), true, false);
                     }
                     919 => {
                         log::error!("程序内部错误！该项目区分绑定非绑定项目错误，传入意外值，请尝试重新下单以及提出issue");
+                        report_order_error("程序内部错误！该项目区分绑定非绑定项目错误，传入意外值，请尝试重新下单以及提出issue（919）".to_string(), true, true);
                         return Some((true,false));
                     }
 
                     //未知错误
-                    _ => log::error!("下单失败，未知错误码：{} 可以提出issue收集上报该问题", e),
+                    _ => {
+                        log::error!("下单失败，未知错误码：{} 可以提出issue收集上报该问题", e);
+                        report_order_error(format!("下单失败（{}）", e), true, false);
+                    }
                 }
             }
         }

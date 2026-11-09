@@ -2,8 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::epaint::Vec2;
 mod app;
+mod state;
 mod ui;
-mod windows;
 fn main() -> Result<(), eframe::Error> {
     
     #[cfg(target_os = "linux")]
@@ -42,10 +42,12 @@ fn main() -> Result<(), eframe::Error> {
     create_resources_directory();
 
     let options = eframe::NativeOptions {
-        initial_window_size: Some(Vec2::new(1200.0, 600.0)),
-        min_window_size: Some(Vec2::new(800.0, 600.0)),
+        initial_window_size: Some(Vec2::new(1200.0, 760.0)),
+        min_window_size: Some(Vec2::new(900.0, 600.0)),
         vsync: true,
-        
+        // 主题由设置页的“跟随系统 / 浅色 / 深色”决定，见 Myapp::sync_theme
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Light,
         ..Default::default()
     };
 

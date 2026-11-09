@@ -344,6 +344,50 @@ pub struct RunningTaskInfo {
     pub status: TaskStatus,
     /// 查询时即时算出的已运行秒数
     pub elapsed_secs: u64,
+    pub phase: GrabPhase,
+    /// 开售时间（秒级时间戳），定时模式进入等待后才有
+    pub sale_at: Option<i64>,
+    /// 已提交下单次数
+    pub attempts: u32,
+    /// 捡漏模式已完成的检查轮数
+    pub rounds: u32,
+    pub last_event: Option<TaskEvent>,
+    /// “场次 · 票种 × 数量”
+    pub target: String,
+    pub project_id: String,
+    pub ticket_id: String,
+}
+
+/// 抢票任务所处阶段，由后端在关键日志旁上报
+#[derive(Clone, Debug, PartialEq)]
+pub enum GrabPhase {
+    Preparing,
+    WaitingSale,
+    Grabbing,
+    Captcha,
+    Monitoring,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskEvent {
+    pub text: String,
+    pub is_error: bool,
+    pub at: std::time::SystemTime,
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskOutcome {
+    Succeeded,
+    Stopped,
+    Ended(String),
+}
+
+/// 已结束抢票任务的最后快照
+#[derive(Clone, Debug)]
+pub struct FinishedTaskInfo {
+    pub info: RunningTaskInfo,
+    pub outcome: TaskOutcome,
+    pub finished_at: std::time::SystemTime,
 }
 
 // 更新 TaskManager trait
@@ -365,6 +409,9 @@ pub trait TaskManager: Send + 'static {
 
     // 列出所有正在运行的抢票任务快照
     fn list_running_tasks(&self) -> Vec<RunningTaskInfo>;
+
+    // 取出自上次调用以来结束的抢票任务
+    fn take_finished_tasks(&mut self) -> Vec<FinishedTaskInfo>;
 
      // 关闭任务管理器
     fn shutdown(&mut self);

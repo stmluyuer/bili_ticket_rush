@@ -1,5 +1,7 @@
-pub mod fonts;
-pub mod sidebar;
-pub mod tabs;
-pub mod loading;
-pub mod error_banner;
+pub mod dialogs;
+pub mod modal;
+pub mod pages;
+pub mod shell;
+pub mod theme;
+pub mod toast;
+pub mod widgets;

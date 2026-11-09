@@ -12,6 +12,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use common::taskmanager::{*};
 use common::captcha::handle_risk_verification;
 use common::login::{send_loginsms,sms_login};
@@ -25,6 +26,7 @@ use crate::api::{*};
 struct GrabTaskEntry {
     info_seed: RunningTaskInfo,
     start_time: std::time::Instant,
+    sale_deadline: Option<Instant>,
     cancel: watch::Sender<bool>,
     outcome: Option<TaskOutcome>,
 }
@@ -44,6 +46,8 @@ impl GrabTaskEntry {
                 elapsed_secs: 0,
                 phase: GrabPhase::Preparing,
                 sale_at: None,
+                sale_at_ms: None,
+                remaining_ms: None,
                 attempts: 0,
                 rounds: 0,
                 last_event: None,
@@ -53,9 +57,22 @@ impl GrabTaskEntry {
                 order: None,
             },
             start_time: std::time::Instant::now(),
+            sale_deadline: None,
             cancel: watch::channel(false).0,
             outcome: None,
         }
+    }
+
+    fn snapshot(&self) -> RunningTaskInfo {
+        let mut info = self.info_seed.clone();
+        info.elapsed_secs = self.start_time.elapsed().as_secs();
+        info.remaining_ms = self.sale_deadline.map(|deadline| {
+            deadline.saturating_duration_since(Instant::now()).as_millis() as u64
+        });
+        if *self.cancel.borrow() {
+            info.status = TaskStatus::Cancelling;
+        }
+        info
     }
 }
 
@@ -717,14 +734,7 @@ impl TaskManager for TaskManagerImpl {
             .unwrap_or_else(|e| e.into_inner());
         let mut tasks: Vec<RunningTaskInfo> = registry
             .values()
-            .map(|entry| {
-                let mut info = entry.info_seed.clone();
-                info.elapsed_secs = entry.start_time.elapsed().as_secs();
-                if *entry.cancel.borrow() {
-                    info.status = TaskStatus::Cancelling;
-                }
-                info
-            })
+            .map(GrabTaskEntry::snapshot)
             .collect();
         tasks.sort_by_key(|t| t.seq);
         tasks
@@ -746,15 +756,18 @@ impl TaskManager for TaskManagerImpl {
     }
 }
 
-const CREATE_INTERVAL: Duration = Duration::from_millis(400);
 const PREPARE_INTERVAL: Duration = Duration::from_secs(1);
 const CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
 const ORDER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(30);
+const PREWARM_LEAD: Duration = Duration::from_secs(5);
 const MAX_TOKEN_REFRESHES: u8 = 5;
 const MAX_CONFIRM_ATTEMPTS: u8 = 4;
 const MAX_ORDER_CHECKS: u32 = 30;
+const MAX_STOCK_CHECKS: u32 = 30;
+const MAX_UNKNOWN_STOCK: u32 = 3;
+const INSUFFICIENT_STOCK: i64 = 100009;
 
 enum TargetExit {
     NextTarget(String),
@@ -776,7 +789,7 @@ enum BusinessRejection {
 fn business_rejection(code: i64) -> Option<BusinessRejection> {
     Some(match code {
         100001 | 429 | 900001 => BusinessRejection::Retry(Duration::from_millis(300)),
-        100009 => BusinessRejection::Retry(Duration::from_millis(600)),
+        INSUFFICIENT_STOCK => BusinessRejection::Retry(Duration::from_millis(600)),
         211 => BusinessRejection::Retry(Duration::ZERO),
         3 => BusinessRejection::Retry(Duration::from_millis(4800)),
         100041 | 100050 | 900002 => BusinessRejection::RefreshToken,
@@ -872,16 +885,32 @@ async fn run_grab(request: &mut GrabTicketRequest, cancel: &mut watch::Receiver<
     if request.uid != request.biliticket.uid || request.uid != request.biliticket.account.uid {
         return TaskOutcome::Ended("购票请求的账号与提交快照不符".to_string());
     }
+    if let Err(error) = request.biliticket.config.validate_purchase() {
+        return TaskOutcome::Ended(error);
+    }
     match request.grab_mode {
         0 | 1 => {
             let target = match select_target(request) {
                 Ok(target) => target,
                 Err(error) => return TaskOutcome::Ended(error.to_string()),
             };
-            let sale_begin = request.biliticket.project_info.as_ref().and_then(|project| project.sale_begin);
-            let cpdd = token_generator(&request.cookie_manager, sale_begin);
-            if request.grab_mode == 0 {
-                if let Err(outcome) = wait_for_sale(request, cancel).await {
+            let project = request.biliticket.project_info.as_ref();
+            let timed_sale = if request.grab_mode == 0 {
+                let sale_begin = project.and_then(|project| {
+                    project.target_sale_begin(target.screen_id.try_into().ok()?, target.sku_id.try_into().ok()?)
+                });
+                let Some(sale_begin) = sale_begin else {
+                    return TaskOutcome::Ended("所选场次和票档没有可靠的开售时间".to_string());
+                };
+                Some(sale_begin)
+            } else {
+                None
+            };
+            let cpdd = token_generator(
+                &request.cookie_manager, timed_sale.or_else(|| project.and_then(|project| project.sale_begin)),
+            );
+            if let Some(sale_begin) = timed_sale {
+                if let Err(outcome) = wait_for_sale(request, sale_begin, cancel).await {
                     return outcome;
                 }
             }
@@ -915,37 +944,54 @@ fn token_generator(cookie_manager: &CookieManager, sale_begin: Option<i64>) -> A
     )))
 }
 
-async fn wait_for_sale(request: &GrabTicketRequest, cancel: &mut watch::Receiver<bool>) -> Result<(), TaskOutcome> {
-    let info = &request.biliticket.project_info;
-    let countdown = get_countdown(request.cookie_manager.clone(), info.clone());
-    let mut countdown = match while_running(cancel, countdown).await {
-        Some(Ok(seconds)) => seconds,
-        Some(Err(error)) => return Err(TaskOutcome::Ended(format!("获取倒计时失败：{error}"))),
-        None => return Err(TaskOutcome::Stopped),
-    };
-    if countdown <= 0.0 {
+async fn wait_for_sale(
+    request: &GrabTicketRequest,
+    sale_begin: i64,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), TaskOutcome> {
+    let sale_at_ms = request.biliticket.config.sale_target_millis(sale_begin).map_err(TaskOutcome::Ended)?;
+    let sample = while_running(cancel, sample_clock(request.cookie_manager.clone()))
+        .await.ok_or(TaskOutcome::Stopped)?;
+    if !sample.from_server {
+        log::warn!("服务器校时失败，使用本机时间等待开售");
+    }
+    let delay = Duration::from_millis(sale_at_ms.saturating_sub(sample.unix_ms).max(0) as u64);
+    let deadline = sample.sampled_at.checked_add(delay)
+        .ok_or_else(|| TaskOutcome::Ended("开售等待期限超出支持范围".to_string()))?;
+    let waiting = deadline > Instant::now();
+    report(|entry| {
+        entry.sale_deadline = Some(deadline);
+        entry.info_seed.sale_at = Some(sale_begin);
+        entry.info_seed.sale_at_ms = Some(sale_at_ms);
+        if waiting {
+            entry.info_seed.phase = GrabPhase::WaitingSale;
+        }
+    });
+    if !waiting {
         return Ok(());
     }
-    report(|entry| {
-        entry.info_seed.phase = GrabPhase::WaitingSale;
-        entry.info_seed.sale_at = info.as_ref().and_then(|project| project.sale_begin);
-    });
-    while countdown > 20.0 {
-        if !wait_running(cancel, Duration::from_secs(15)).await {
-            return Err(TaskOutcome::Stopped);
+    while_running(cancel, async {
+        let wait = tokio::time::sleep_until(deadline);
+        tokio::pin!(wait);
+        let prewarm = async {
+            // 临近开售再预热，避免提前很久建立的连接因闲置而断开。
+            if let Some(start) = deadline.checked_sub(PREWARM_LEAD) {
+                tokio::time::sleep_until(start).await;
+            }
+            prewarm_ticket_connection(request.cookie_manager.clone()).await
+        };
+        // 到开售期限直接丢弃未完成的预热，请求与等待都随取消结束。
+        tokio::select! {
+            biased;
+            _ = &mut wait => {},
+            result = prewarm => {
+                if let Err(error) = result {
+                    log::warn!("预热票务连接失败：{error}");
+                }
+                wait.await;
+            }
         }
-        countdown -= 15.0;
-    }
-    while countdown > 1.3 {
-        if !wait_running(cancel, Duration::from_secs(1)).await {
-            return Err(TaskOutcome::Stopped);
-        }
-        countdown -= 1.0;
-    }
-    if !wait_running(cancel, Duration::from_millis(800)).await {
-        return Err(TaskOutcome::Stopped);
-    }
-    Ok(())
+    }).await.ok_or(TaskOutcome::Stopped)
 }
 
 async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Receiver<bool>) -> TaskOutcome {
@@ -956,16 +1002,19 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
     if !request.project_id.parse::<i64>().is_ok_and(|id| id > 0) {
         return TaskOutcome::Ended("项目 ID 无效".to_string());
     }
+    let interval = Duration::from_millis(request.biliticket.config.stock_interval_ms);
     loop {
         report_phase(GrabPhase::Monitoring);
-        let project = get_project(
+        let project = get_project_live(
             request.cookie_manager.clone(), &request.project_id, &request.biliticket.referer,
         );
         let project = match while_running(cancel, project).await {
             Some(Ok(project)) => project.data,
             Some(Err(error)) => {
-                report_event(format!("获取项目数据失败：{error}"), true);
-                if !wait_running(cancel, Duration::from_secs(2)).await {
+                let message = format!("实时项目扫描失败，候选状态未知：{error}");
+                log::warn!("{message}");
+                report_event(message, true);
+                if !wait_running(cancel, interval).await {
                     return TaskOutcome::Stopped;
                 }
                 continue;
@@ -1022,7 +1071,7 @@ async fn monitor_targets(request: &mut GrabTicketRequest, cancel: &mut watch::Re
                 entry.info_seed.last_event = Some(event(format!("第 {} 轮检查完毕", entry.info_seed.rounds), false));
             }
         });
-        if !wait_running(cancel, Duration::from_secs(2)).await {
+        if !wait_running(cancel, interval).await {
             return TaskOutcome::Stopped;
         }
     }
@@ -1183,6 +1232,52 @@ fn create_limit_reached(limit: u32) -> TargetExit {
     TargetExit::NextTarget(format!("创建订单已达上限（{limit} 次）"))
 }
 
+async fn wait_for_stock(
+    request: &GrabTicketRequest,
+    target: &PurchaseTarget,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), TargetExit> {
+    let interval = Duration::from_millis(request.biliticket.config.stock_interval_ms);
+    let mut checks = 0;
+    let mut consecutive_unknown = 0;
+    loop {
+        let check = check_stock(request.cookie_manager.clone(), target);
+        let result = while_running(cancel, check).await
+            .ok_or(TargetExit::Finished(TaskOutcome::Stopped))?;
+        checks += 1;
+        let (status, delay) = match result {
+            Ok(status) => (status, interval),
+            Err(error) => {
+                log::warn!("查询库存失败：{error}");
+                (StockStatus::Unknown, interval.max(error.retry_after().unwrap_or_default()))
+            }
+        };
+        match status {
+            StockStatus::Available => return Ok(()),
+            StockStatus::Unavailable if checks == MAX_STOCK_CHECKS => {
+                return Err(TargetExit::NextTarget(format!("库存等待到限（{MAX_STOCK_CHECKS} 次）")));
+            }
+            StockStatus::Unavailable => {
+                consecutive_unknown = 0;
+                report_event(format!("当前票档暂无库存（{checks}/{MAX_STOCK_CHECKS}）"), false);
+            }
+            StockStatus::Unknown => {
+                consecutive_unknown += 1;
+                if consecutive_unknown == MAX_UNKNOWN_STOCK || checks == MAX_STOCK_CHECKS {
+                    let message = format!("库存未知（已查询 {checks} 次），继续尝试创建订单");
+                    log::warn!("{message}");
+                    report_event(message, true);
+                    return Ok(());
+                }
+                report_event(format!("库存未知（{checks}/{MAX_STOCK_CHECKS}）"), true);
+            }
+        }
+        if !wait_running(cancel, delay).await {
+            return Err(TargetExit::Finished(TaskOutcome::Stopped));
+        }
+    }
+}
+
 async fn create_on_target(
     request: &GrabTicketRequest,
     target: &PurchaseTarget,
@@ -1194,6 +1289,8 @@ async fn create_on_target(
     limit: u32,
     cancel: &mut watch::Receiver<bool>,
 ) -> PreparedExit {
+    let config = &request.biliticket.config;
+    let create_interval = Duration::from_millis(config.create_interval_ms);
     let mut order = OrderContext {
         order_id: None,
         query_token: None,
@@ -1247,7 +1344,7 @@ async fn create_on_target(
             }
         };
         let reason = format!("创建订单失败：{error}");
-        let delay = CREATE_INTERVAL.max(error.retry_after().unwrap_or_default());
+        let delay = create_interval.max(error.retry_after().unwrap_or_default());
         match error {
             PurchaseApiError::Business { code, .. } => {
                 let Some(rejection) = business_rejection(code) else {
@@ -1261,9 +1358,17 @@ async fn create_on_target(
                 match rejection {
                     BusinessRejection::Retry(wait) => {
                         report_event(reason, false);
-                        if (*attempts < limit || request.grab_mode == 2)
-                            && !wait_running(cancel, delay.max(wait)).await
-                        {
+                        if *attempts == limit && request.grab_mode != 2 {
+                            return PreparedExit::Target(create_limit_reached(limit));
+                        }
+                        // 库存查询所花的时间也计入本次创建退避。
+                        let retry = tokio::time::sleep(delay.max(wait));
+                        if request.grab_mode != 2 && config.stock_check && code == INSUFFICIENT_STOCK {
+                            if let Err(exit) = wait_for_stock(request, target, cancel).await {
+                                return PreparedExit::Target(exit);
+                            }
+                        }
+                        if while_running(cancel, retry).await.is_none() {
                             return PreparedExit::Target(TargetExit::Finished(TaskOutcome::Stopped));
                         }
                     }
@@ -1358,7 +1463,7 @@ async fn check_existing_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::purchase_test::{with_responses, Endpoint, RecordedRequest, Reply};
+    use crate::api::purchase_test::{seed_project_cache, with_responses, Endpoint, RecordedRequest, Reply};
     use common::account::Account;
     use common::captcha::LocalCaptcha;
     use common::utility::CustomConfig;
@@ -1381,6 +1486,7 @@ mod tests {
     struct Fixture {
         guard: GrabRegistryGuard,
         request: GrabTicketRequest,
+        cached_project: Option<Value>,
     }
 
     struct Trace {
@@ -1391,9 +1497,19 @@ mod tests {
 
     impl Fixture {
         fn new(mode: u8) -> Self {
-            let cookie_manager = Arc::new(CookieManager::from_client(Arc::new(reqwest::Client::new()), ""));
+            Self::with_config(mode, &CustomConfig::new())
+        }
+
+        fn with_config(mode: u8, config: &CustomConfig) -> Self {
+            Self::with_target(mode, config, 123, 31)
+        }
+
+        fn with_target(mode: u8, config: &CustomConfig, uid: i64, sku_id: i64) -> Self {
+            let cookie_manager = Arc::new(CookieManager::from_client(
+                Arc::new(reqwest::Client::new()), &format!("DedeUserID={uid}"),
+            ));
             let account = Account {
-                uid: 123,
+                uid,
                 name: "测试账号".into(),
                 level: String::new(),
                 cookie: String::new(),
@@ -1409,27 +1525,27 @@ mod tests {
             let mut biliticket = BilibiliTicket::new(
                 &mode,
                 &"购票测试".to_string(),
-                &CustomConfig::new(),
+                config,
                 &account,
                 &PushConfig::new(),
                 &0,
                 "11",
                 "https://show.bilibili.com/",
             );
-            biliticket.project_info = Some(serde_json::from_value(project_data(&[31])).unwrap());
+            biliticket.project_info = Some(serde_json::from_value(project_data(&[sku_id])).unwrap());
             biliticket.id_bind = 2;
             let buyer_info = [100, 101].into_iter().map(|id| {
                 serde_json::from_value(json!({
-                    "id": id, "uid": 123, "personal_id": "", "name": "测试购票人",
+                    "id": id, "uid": uid, "personal_id": "", "name": "测试购票人",
                     "tel": "", "id_type": 0, "is_default": 0,
                 })).unwrap()
             }).collect();
             let request = GrabTicketRequest {
-                task_id: "test-grab".into(),
+                task_id: format!("test-grab-{uid}"),
                 uid: account.uid,
                 project_id: "11".into(),
                 screen_id: if mode == 2 { String::new() } else { "21".into() },
-                ticket_id: if mode == 2 { String::new() } else { "31".into() },
+                ticket_id: if mode == 2 { String::new() } else { sku_id.to_string() },
                 count: 2,
                 buyer_info,
                 cookie_manager,
@@ -1449,7 +1565,7 @@ mod tests {
                 finished: Arc::new(Mutex::new(Vec::new())),
                 task_id: request.task_id.clone(),
             };
-            Self { guard, request }
+            Self { guard, request, cached_project: None }
         }
 
         async fn run(self, responses: Vec<Response>) -> Trace {
@@ -1459,13 +1575,19 @@ mod tests {
             let registry_for_probe = registry.clone();
             let notices = Arc::new(Mutex::new(Vec::new()));
             let notices_for_probe = notices.clone();
+            let run = async move {
+                if let Some(project) = self.cached_project {
+                    seed_project_cache(&self.request.project_id, project);
+                }
+                run_registered_grab_task(self.guard, self.request).await;
+            };
             let (_, requests) = NOTICE_PROBE.scope(
                 Box::new(move |notice| {
                     assert!(registry_for_probe.lock().unwrap().is_empty());
                     assert_eq!(finished_for_probe.lock().unwrap().len(), 1);
                     notices_for_probe.lock().unwrap().push((notice.message.clone(), notice.jump_url.clone()));
                 }),
-                with_responses(responses, run_registered_grab_task(self.guard, self.request)),
+                with_responses(responses, run),
             ).await;
             assert!(registry.lock().unwrap().is_empty());
             let mut finished = finished.lock().unwrap();
@@ -1492,6 +1614,10 @@ mod tests {
 
     fn clock(now: i64) -> Response {
         (Endpoint::Clock, Reply::Json(json!({ "code": 0, "data": { "now": now } })))
+    }
+
+    fn stock(status: i64) -> Response {
+        (Endpoint::Stock, Reply::Json(json!({ "code": 0, "data": { "stockStatus": status } })))
     }
 
     fn prepare(token: &str) -> Response {
@@ -1551,7 +1677,8 @@ mod tests {
 
     #[tokio::test]
     async fn timed_mode_refreshes_and_checks_last_allowed_create() {
-        let mut fixture = Fixture::new(0);
+        let config = CustomConfig { create_interval_ms: 1, ..CustomConfig::new() };
+        let mut fixture = Fixture::with_config(0, &config);
         fixture.request.biliticket.push_self.enabled = true;
         let mut responses = vec![
             clock(SALE_BEGIN),
@@ -1563,7 +1690,8 @@ mod tests {
             prepare("refreshed"),
             confirm(0),
         ];
-        responses.extend((0..58).map(|_| rejection(Endpoint::Create, 211)));
+        responses.push(rejection(Endpoint::Create, INSUFFICIENT_STOCK));
+        responses.extend((0..57).map(|_| rejection(Endpoint::Create, 211)));
         responses.extend([
             created(None, Some("same+query")),
             (Endpoint::Check, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
@@ -1605,13 +1733,17 @@ mod tests {
 
     #[tokio::test]
     async fn direct_mode_keeps_create_budget_across_refresh() {
+        let mut config = CustomConfig::new();
+        config.stock_check = true;
+        config.create_interval_ms = 1;
         let mut responses = vec![
             prepare("before-create"), confirm(123),
             rejection(Endpoint::Create, 100050),
             prepare("refreshed"), confirm(123),
         ];
-        responses.extend((0..59).map(|_| rejection(Endpoint::Create, 211)));
-        let trace = Fixture::new(1).run(responses).await;
+        responses.extend((0..58).map(|_| rejection(Endpoint::Create, 211)));
+        responses.push(rejection(Endpoint::Create, INSUFFICIENT_STOCK));
+        let trace = Fixture::with_config(1, &config).run(responses).await;
         assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("60 次")));
         assert_eq!(trace.finished.info.attempts, 60);
         assert!(trace.finished.info.order.is_none());
@@ -1627,13 +1759,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stock_checks_follow_explicit_shortage_and_keep_each_tasks_context() {
+        let interval = Duration::from_millis(180);
+        let mut config = CustomConfig {
+            stock_check: true,
+            stock_interval_ms: interval.as_millis() as u64,
+            create_interval_ms: 1,
+            ..CustomConfig::new()
+        };
+        let timed = Fixture::with_target(0, &config, 123, 31);
+        let direct = Fixture::with_target(1, &config, 456, 32);
+        config.stock_check = false;
+        config.stock_interval_ms = 2_000;
+        assert_ne!(timed.request.biliticket.config.stock_check, config.stock_check);
+        assert_ne!(direct.request.biliticket.config.stock_interval_ms, config.stock_interval_ms);
+
+        let responses = |order_id| [
+            prepare("test"), confirm(0), rejection(Endpoint::Create, 211),
+            rejection(Endpoint::Create, INSUFFICIENT_STOCK),
+            stock(1), stock(2), stock(3), created(Some(order_id), Some("query")), payable(Some(order_id)),
+        ];
+        let timed_responses = [clock(SALE_BEGIN)].into_iter().chain(responses(123)).collect();
+        let (timed, direct) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(timed.run(timed_responses), direct.run(Vec::from(responses(456))))
+        }).await.unwrap();
+        for (trace, uid, sku) in [(timed, 123, 31), (direct, 456, 32)] {
+            assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+            assert_eq!(trace.finished.info.uid, uid as i64);
+            assert_eq!(trace.finished.info.attempts, 3);
+            assert!(trace.requests.iter().all(|request| request.account_uid == Some(uid)));
+            for request in requests(&trace, Endpoint::Prepare).chain(requests(&trace, Endpoint::Create)) {
+                assert_amount_and_target(request, sku, None);
+            }
+            let checks: Vec<_> = requests(&trace, Endpoint::Stock).collect();
+            assert_eq!(checks.len(), 3);
+            for check in &checks {
+                let body = check.body.as_ref().unwrap();
+                assert_eq!(body["projectId"], "11");
+                assert_eq!(body["screenId"], 21);
+                assert_eq!(body["skuId"], sku);
+            }
+            assert!(checks.windows(2).all(|pair| pair[1].at - pair[0].at >= interval));
+            let creates: Vec<_> = requests(&trace, Endpoint::Create).collect();
+            let retry_gap = creates[2].at - creates[1].at;
+            assert!((Duration::from_millis(600)..Duration::from_millis(900)).contains(&retry_gap));
+        }
+    }
+
+    #[tokio::test]
+    async fn stock_budget_distinguishes_final_unavailable_from_final_unknown() {
+        let config = CustomConfig { stock_check: true, stock_interval_ms: 1, ..CustomConfig::new() };
+        for last_status in [2, 99] {
+            let mut responses = vec![prepare("test"), confirm(0), rejection(Endpoint::Create, INSUFFICIENT_STOCK)];
+            responses.extend((1..30).map(|_| stock(1)));
+            responses.push(stock(last_status));
+            if last_status == 99 {
+                responses.extend([created(Some(75), Some("query")), payable(Some(75))]);
+            }
+            let trace = tokio::time::timeout(Duration::from_secs(4), Fixture::with_config(1, &config).run(responses))
+                .await.unwrap();
+            assert_eq!(requests(&trace, Endpoint::Stock).count(), 30);
+            if last_status == 2 {
+                assert_eq!(trace.finished.info.attempts, 1);
+                assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("库存等待到限")));
+            } else {
+                assert_eq!(trace.finished.info.attempts, 2);
+                assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stock_wait_falls_back_after_three_consecutive_unknown_results() {
+        let config = CustomConfig { stock_check: true, stock_interval_ms: 1, ..CustomConfig::new() };
+        let trace = Fixture::with_config(1, &config).run(vec![
+            prepare("test"), confirm(0), rejection(Endpoint::Create, INSUFFICIENT_STOCK),
+            (Endpoint::Stock, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)), stock(99), stock(2),
+            stock(99), (Endpoint::Stock, Reply::Raw(b"{")), stock(99),
+            created(Some(75), Some("query")), payable(Some(75)),
+        ]).await;
+        assert_eq!(requests(&trace, Endpoint::Stock).count(), 6);
+        assert_eq!(trace.finished.info.attempts, 2);
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+    }
+
+    #[tokio::test]
+    async fn create_retry_wait_uses_the_maximum_of_config_business_and_retry_after() {
+        let config = CustomConfig { create_interval_ms: 200, ..CustomConfig::new() };
+        let trace = Fixture::with_config(1, &config).run(vec![
+            prepare("test"), confirm(0),
+            rejection(Endpoint::Create, 211),
+            rejection(Endpoint::Create, INSUFFICIENT_STOCK),
+            (Endpoint::Create, Reply::JsonWithRetryAfter(
+                json!({"errno": INSUFFICIENT_STOCK, "msg": "测试限速"}),
+                Duration::from_millis(900),
+            )),
+            created(Some(75), Some("query")), payable(Some(75)),
+        ]).await;
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        let creates: Vec<_> = requests(&trace, Endpoint::Create).collect();
+        assert_eq!(creates.len(), 4);
+        for (pair, expected_ms) in creates.windows(2).zip([200, 600, 900]) {
+            let gap = pair[1].at - pair[0].at;
+            let expected = Duration::from_millis(expected_ms);
+            assert!((expected..expected + Duration::from_millis(170)).contains(&gap), "创建间隔 {gap:?}，预期 {expected:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn monitor_mode_visits_next_ticket_in_the_same_screen_after_limit() {
+        let mut config = CustomConfig::new();
+        config.stock_check = true;
+        config.create_interval_ms = 1;
         let mut responses = vec![
             (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[31, 32])}))),
             prepare("initial"), confirm(123), rejection(Endpoint::Create, 900002),
             prepare("refreshed"), confirm(123),
         ];
-        responses.extend((0..28).map(|_| rejection(Endpoint::Create, 211)));
+        responses.extend((0..27).map(|_| rejection(Endpoint::Create, 211)));
+        responses.push(rejection(Endpoint::Create, INSUFFICIENT_STOCK));
         let retry_after = Duration::from_secs(1);
         let (throttled, last_create, release_create) = hold(Reply::JsonWithRetryAfter(
             json!({"errno": 100001, "msg": "测试明确限速拒绝"}),
@@ -1648,7 +1892,7 @@ mod tests {
             payable(Some(76)),
         ]);
 
-        let (trace, ()) = tokio::join!(Fixture::new(2).run(responses), async {
+        let (trace, ()) = tokio::join!(Fixture::with_config(2, &config).run(responses), async {
             tokio::time::timeout(Duration::from_secs(20), last_create.notified()).await.unwrap();
             let rejected_at = tokio::time::Instant::now();
             release_create.notify_one();
@@ -1670,6 +1914,33 @@ mod tests {
         for (index, create) in requests(&trace, Endpoint::Create).enumerate() {
             assert_amount_and_target(create, if index < 30 { 31 } else { 32 }, Some(123));
         }
+    }
+
+    #[tokio::test]
+    async fn monitoring_skips_cached_and_excluded_candidates_and_waits_between_live_scans() {
+        let interval = Duration::from_millis(100);
+        let config = CustomConfig { stock_interval_ms: interval.as_millis() as u64, ..CustomConfig::new() };
+        let mut fixture = Fixture::with_config(2, &config);
+        fixture.cached_project = Some(json!({"errno": 0, "data": project_data(&[31])}));
+        fixture.request.skip_words = Some(vec!["票档 33".into()]);
+        let trace = tokio::time::timeout(Duration::from_secs(3), fixture.run(vec![
+            (Endpoint::Project, Reply::Json(json!({"errno": 4321, "data": project_data(&[31])}))),
+            (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[33])}))),
+            (Endpoint::Project, Reply::Json(json!({"errno": 0, "data": project_data(&[32])}))),
+            prepare("live"), confirm(0), created(Some(75), Some("query")), payable(Some(75)),
+        ])).await.unwrap();
+
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        assert_eq!(trace.finished.info.rounds, 1);
+        let scans: Vec<_> = requests(&trace, Endpoint::Project).collect();
+        assert_eq!(scans.len(), 3);
+        for pair in scans.windows(2) {
+            let gap = pair[1].at - pair[0].at;
+            assert!((interval..Duration::from_secs(1)).contains(&gap));
+        }
+        let creates: Vec<_> = requests(&trace, Endpoint::Create).collect();
+        assert_eq!(creates.len(), 1);
+        assert_amount_and_target(creates[0], 32, Some(0));
     }
 
     #[tokio::test]
@@ -1852,27 +2123,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_wait_cancellation_never_starts_prepare() {
+    async fn timed_wait_uses_snapshot_deadline_even_if_prewarm_fails_or_stays_pending() {
+        let sale_begin = SALE_BEGIN + 20;
+        let delay = Duration::from_millis(900);
+        for release_warm in [true, false] {
+            let mut config = CustomConfig { sale_delay_ms: delay.as_millis() as u64, ..CustomConfig::new() };
+            let mut fixture = Fixture::with_config(0, &config);
+            fixture.request.biliticket.project_info.as_mut().unwrap().screen_list[0]
+                .ticket_list[0].saleStart = Some(sale_begin as usize);
+            config.sale_delay_ms = 30_000;
+            assert_ne!(fixture.request.biliticket.config.sale_delay_ms, config.sale_delay_ms);
+            let registry = fixture.guard.registry.clone();
+            let task_id = fixture.request.task_id.clone();
+            let (warm, warm_entered, warm_release) = hold(Reply::TransportFailure);
+            let (prepare_reply, prepare_entered, prepare_release) = hold(prepare("timed").1);
+            let responses = vec![
+                clock(sale_begin), (Endpoint::Prewarm, warm), (Endpoint::Prepare, prepare_reply),
+                confirm(0), created(Some(75), Some("query")), payable(Some(75)),
+            ];
+
+            let (trace, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(fixture.run(responses), async {
+                    warm_entered.notified().await;
+                    let first = registry.lock().unwrap()[&task_id].snapshot();
+                    assert_eq!(first.phase, GrabPhase::WaitingSale);
+                    assert_eq!(first.sale_at, Some(sale_begin));
+                    assert_eq!(first.sale_at_ms, Some(sale_begin * 1_000 + delay.as_millis() as i64));
+                    let remaining = first.remaining_ms.unwrap();
+                    assert!((1..=delay.as_millis() as u64).contains(&remaining));
+                    if release_warm {
+                        warm_release.notify_one();
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let later = registry.lock().unwrap()[&task_id].snapshot();
+                    assert!(remaining.saturating_sub(later.remaining_ms.unwrap()) >= 95);
+
+                    prepare_entered.notified().await;
+                    let started = registry.lock().unwrap()[&task_id].snapshot();
+                    assert_eq!(started.phase, GrabPhase::Preparing);
+                    assert_eq!(started.remaining_ms, Some(0));
+                    prepare_release.notify_one();
+                })
+            }).await.unwrap();
+            assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+            assert_eq!(requests(&trace, Endpoint::Prewarm).count(), 1);
+            let clock = requests(&trace, Endpoint::Clock).next().unwrap();
+            let prepare = requests(&trace, Endpoint::Prepare).next().unwrap();
+            assert!((delay..delay + Duration::from_millis(350)).contains(&(prepare.at - clock.at)));
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_wait_requires_reliable_target_time_and_can_fall_back_to_local_clock() {
+        let mut fixture = Fixture::new(0);
+        fixture.request.biliticket.project_info.as_mut().unwrap().screen_list[0].sale_start = 0;
+        let trace = fixture.run(Vec::new()).await;
+        assert!(matches!(&trace.finished.outcome, TaskOutcome::Ended(reason) if reason.contains("没有可靠的开售时间")));
+        assert!(trace.requests.is_empty());
+
+        let mut fixture = Fixture::new(0);
+        fixture.request.biliticket.project_info.as_mut().unwrap().screen_list[0].ticket_list[0].saleStart = Some(1);
+        let trace = fixture.run(vec![
+            (Endpoint::Clock, Reply::TransportFailure), prepare("local"), confirm(0),
+            created(Some(75), Some("query")), payable(Some(75)),
+        ]).await;
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Succeeded));
+        assert_eq!(trace.finished.info.sale_at_ms, Some(1_000));
+        assert_eq!(requests(&trace, Endpoint::Prewarm).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_timed_prewarm_never_starts_prepare() {
         let fixture = Fixture::new(0);
         let registry = fixture.guard.registry.clone();
         let task_id = fixture.request.task_id.clone();
-        let (clock, entered, release) = hold(clock(SALE_BEGIN - 60).1);
-        let (trace, ()) = tokio::join!(fixture.run(vec![(Endpoint::Clock, clock)]), async {
-            tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
-            release.notify_one();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if registry.lock().unwrap()[&task_id].info_seed.phase == GrabPhase::WaitingSale {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }).await.unwrap();
-            registry.lock().unwrap()[&task_id].cancel.send_replace(true);
-        });
+        let (warm, entered, _release) = hold(Reply::Http(StatusCode::OK, None));
+        let (trace, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(fixture.run(vec![clock(SALE_BEGIN - 2), (Endpoint::Prewarm, warm)]), async {
+                entered.notified().await;
+                let registry = registry.lock().unwrap();
+                let entry = &registry[&task_id];
+                assert_eq!(entry.snapshot().phase, GrabPhase::WaitingSale);
+                entry.cancel.send_replace(true);
+            })
+        }).await.unwrap();
         assert!(matches!(trace.finished.outcome, TaskOutcome::Stopped));
-        assert_eq!(trace.requests.len(), 1);
+        assert_eq!(trace.requests.len(), 2);
         assert_eq!(trace.finished.info.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_stock_wait_does_not_create_again() {
+        let config = CustomConfig { stock_check: true, ..CustomConfig::new() };
+        let fixture = Fixture::with_config(1, &config);
+        let registry = fixture.guard.registry.clone();
+        let task_id = fixture.request.task_id.clone();
+        let (stock, entered, _release) = hold(stock(3).1);
+        let responses = vec![
+            prepare("test"), confirm(0), rejection(Endpoint::Create, INSUFFICIENT_STOCK), (Endpoint::Stock, stock),
+        ];
+        let (trace, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(fixture.run(responses), async {
+                entered.notified().await;
+                registry.lock().unwrap()[&task_id].cancel.send_replace(true);
+            })
+        }).await.unwrap();
+        assert!(matches!(trace.finished.outcome, TaskOutcome::Stopped));
+        assert_eq!(trace.finished.info.attempts, 1);
+        assert!(trace.finished.info.order.is_none());
     }
 
     #[tokio::test]

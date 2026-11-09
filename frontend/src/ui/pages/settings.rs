@@ -51,6 +51,8 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                     let mut dirty = false;
                     dirty |= appearance(app, ui, &p);
                     ui.add_space(8.0);
+                    dirty |= purchase(app, ui, &p);
+                    ui.add_space(8.0);
                     dirty |= captcha(app, ui, &p);
                     ui.add_space(8.0);
                     dirty |= network(app, ui, &p);
@@ -114,6 +116,37 @@ fn appearance(app: &mut Myapp, ui: &mut Ui, p: &Palette) -> bool {
         });
     });
     changed
+}
+
+fn purchase(app: &mut Myapp, ui: &mut Ui, p: &Palette) -> bool {
+    let config = &mut app.custom_config;
+    let mut changed = false;
+    card(ui, |ui| {
+        section_title(ui, "购票", |_| {});
+        row(ui, p, "单目标库存检查", |ui| {
+            changed |= switch(ui, &mut config.stock_check)
+                .on_hover_text("下单返回库存不足后，查询当前票种的库存。")
+                .changed();
+        });
+        divider(ui, p);
+        row(ui, p, "开售延迟", |ui| {
+            changed |= millis(ui, &mut config.sale_delay_ms, 0);
+        });
+        divider(ui, p);
+        row(ui, p, "库存查询间隔", |ui| {
+            changed |= millis(ui, &mut config.stock_interval_ms, 1);
+        });
+        divider(ui, p);
+        row(ui, p, "下单基础间隔", |ui| {
+            changed |= millis(ui, &mut config.create_interval_ms, 1);
+        });
+    });
+    changed
+}
+
+fn millis(ui: &mut Ui, value: &mut u64, min: u64) -> bool {
+    ui.add(egui::DragValue::new(value).clamp_range(min..=u64::MAX).suffix(" 毫秒"))
+        .changed()
 }
 
 fn captcha(app: &mut Myapp, ui: &mut Ui, p: &Palette) -> bool {

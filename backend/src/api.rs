@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 use rand::{thread_rng, Rng};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::{timeout, Instant};
 
 fn cache_path(project_id: &str) -> std::path::PathBuf {
     let dir = std::path::Path::new("cache");
@@ -19,6 +20,12 @@ fn cache_path(project_id: &str) -> std::path::PathBuf {
 }
 
 fn save_project_cache(project_id: &str, info: &InfoResponse) {
+    #[cfg(test)]
+    if purchase_test::is_active() {
+        purchase_test::seed_project_cache(project_id, serde_json::to_value(info).unwrap());
+        return;
+    }
+
     let path = cache_path(project_id);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -36,6 +43,11 @@ fn save_project_cache(project_id: &str, info: &InfoResponse) {
 }
 
 fn load_project_cache(project_id: &str) -> Option<InfoResponse> {
+    #[cfg(test)]
+    if purchase_test::is_active() {
+        return purchase_test::cached_project(project_id);
+    }
+
     let path = cache_path(project_id);
     match std::fs::read_to_string(&path) {
         Ok(json) => {
@@ -55,30 +67,32 @@ fn load_project_cache(project_id: &str) -> Option<InfoResponse> {
 }
 
 
-pub async fn get_countdown(
-    cookie_manager: Arc<CookieManager>,
-    info: Option<TicketInfo>,
-) -> Result<f64, String> {
-    let sale_begin = info
-        .ok_or("获取开始时间失败")?
-        .sale_begin
-        .ok_or("开售时间(sale_begin)为空")?;
-    let request = cookie_manager.get("https://api.bilibili.com/x/click-interface/click/now").await;
-    let server_time = match send_purchase(request).await {
-        Ok((value, retry_after)) => purchase_data(&value, retry_after)
-            .ok()
-            .and_then(|data| data["now"].as_i64())
-            .filter(|time| *time > 0),
-        Err(error) => {
-            log::debug!("获取网络时间失败：{error}");
-            None
-        }
-    };
-    let now = server_time.unwrap_or_else(|| {
-        log::debug!("使用本地时间计算开售倒计时");
-        chrono::Utc::now().timestamp()
-    });
-    Ok((sale_begin - now) as f64)
+pub struct ClockSample {
+    pub unix_ms: i64,
+    pub sampled_at: Instant,
+    pub from_server: bool,
+}
+
+pub async fn sample_clock(cookie_manager: Arc<CookieManager>) -> ClockSample {
+    let server_time = timeout(CLOCK_TIMEOUT, async {
+        let request = cookie_manager.get("https://api.bilibili.com/x/click-interface/click/now").await;
+        let (value, retry_after) = send_purchase(request).await?;
+        let data = purchase_data(&value, retry_after)?;
+        data["now"].as_i64()
+            .filter(|time| *time > 0)
+            .and_then(|time| time.checked_mul(1000))
+            .ok_or_else(|| PurchaseApiError::Parse("缺少有效服务器时间".into()))
+    }).await;
+    match server_time {
+        Ok(Ok(unix_ms)) => return ClockSample { unix_ms, sampled_at: Instant::now(), from_server: true },
+        Ok(Err(error)) => log::debug!("获取网络时间失败：{error}，使用本地时间"),
+        Err(_) => log::debug!("获取网络时间超时，使用本地时间"),
+    }
+    ClockSample {
+        unix_ms: chrono::Utc::now().timestamp_millis(),
+        sampled_at: Instant::now(),
+        from_server: false,
+    }
 }
 
 pub async fn get_buyer_info(cookie_manager: Arc<CookieManager>) -> Result<BuyerInfoResponse,String>{
@@ -123,25 +137,35 @@ pub async fn get_buyer_info(cookie_manager: Arc<CookieManager>) -> Result<BuyerI
     }
 }
 
-pub async fn get_project(cookie_manager: Arc<CookieManager>, project_id : &str, referer_link: &str) -> Result<InfoResponse,String>{
+pub async fn get_project_live(
+    cookie_manager: Arc<CookieManager>,
+    project_id: &str,
+    referer_link: &str,
+) -> Result<InfoResponse, String> {
     let url = "https://show.bilibili.com/api/ticket/project/getV2";
     let request = cookie_manager
         .get_with_headers(url, HashMap::from([("Referer", referer_link)]))
         .await
         .query(&[("id", project_id), ("project_id", project_id)]);
-    let result = async {
-        let (value, _) = send_purchase(request).await.map_err(|error| error.to_string())?;
-        let mut info = InfoResponse::deserialize(value)
-            .map_err(|error| format!("解析项目详情失败：{error}"))?;
-        info.data.fill_missing_sale_begin();
-        info.data.validate()?;
-        Ok(info)
-    }.await;
-
-    #[cfg(test)]
-    if purchase_test::is_active() {
-        return result;
+    let (value, retry_after) = send_purchase(request).await.map_err(|error| error.to_string())?;
+    purchase_data(&value, retry_after).map_err(|error| error.to_string())?;
+    let mut info = InfoResponse::deserialize(value)
+        .map_err(|error| format!("解析项目详情失败：{error}"))?;
+    info.data.validate()?;
+    if info.data.id != project_id.parse::<i32>().ok() {
+        return Err(format!("项目详情的 ID 与请求项目 {project_id} 不符"));
     }
+    info.data.raw_sale_begin = info.data.sale_begin.filter(|time| *time > 0);
+    info.data.fill_missing_sale_begin();
+    Ok(info)
+}
+
+pub async fn get_project(
+    cookie_manager: Arc<CookieManager>,
+    project_id: &str,
+    referer_link: &str,
+) -> Result<InfoResponse, String> {
+    let result = get_project_live(cookie_manager, project_id, referer_link).await;
 
     // 成功时缓存到本地，失败时尝试从缓存加载
     match result {
@@ -258,6 +282,8 @@ QrCodeLoginStatus::Expired
 
 
 const PURCHASE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const PREWARM_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PurchaseTarget {
@@ -285,6 +311,13 @@ impl PurchaseTarget {
             count: i32::from(count),
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StockStatus {
+    Available,
+    Unavailable,
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -450,6 +483,61 @@ fn purchase_data(value: &Value, retry_after: Option<Duration>) -> Result<&Value,
     }
 }
 
+pub async fn check_stock(
+    cookie_manager: Arc<CookieManager>,
+    target: &PurchaseTarget,
+) -> Result<StockStatus, PurchaseApiError> {
+    let params = json!({
+        "projectId": target.project_id.to_string(),
+        "skuId": target.sku_id,
+        "screenId": target.screen_id,
+    });
+    let request = cookie_manager.post("https://show.bilibili.com/api/ticket/stock/check").await.json(&params);
+    let (value, retry_after) = send_purchase(request).await?;
+    if value["code"].as_i64().is_none() {
+        return Err(PurchaseApiError::Parse("库存响应缺少有效 code".into()));
+    }
+    let data = purchase_data(&value, retry_after)?;
+    for fields in [&value, data] {
+        for (field, expected) in [
+            ("projectId", target.project_id),
+            ("project_id", target.project_id),
+            ("screenId", target.screen_id),
+            ("screen_id", target.screen_id),
+            ("skuId", target.sku_id),
+            ("sku_id", target.sku_id),
+        ] {
+            if let Some(id) = fields.get(field) {
+                validate_echoed_id(id, field, expected)?;
+            }
+        }
+    }
+    Ok(match data["stockStatus"].as_i64() {
+        Some(3) => StockStatus::Available,
+        Some(1 | 2) => StockStatus::Unavailable,
+        _ => StockStatus::Unknown,
+    })
+}
+
+pub async fn prewarm_ticket_connection(cookie_manager: Arc<CookieManager>) -> Result<(), PurchaseApiError> {
+    let (client, request) = cookie_manager.h2_client
+        .head("https://show.bilibili.com/")
+        .timeout(PREWARM_TIMEOUT)
+        .build_split();
+    let request = request.map_err(|error| {
+        PurchaseApiError::InvalidParameter(format!("无法构造预热请求：{}", error.without_url()))
+    })?;
+
+    #[cfg(test)]
+    if let Some(reply) = purchase_test::take_response(&request) {
+        return purchase_test::resolve_head(reply).await;
+    }
+
+    let response = client.execute(request).await
+        .map_err(|error| PurchaseApiError::Transport(error.without_url()))?;
+    response_status(response.status(), None, false)
+}
+
 fn decode_prepare(
     value: &Value,
     retry_after: Option<Duration>,
@@ -522,18 +610,22 @@ fn confirm_target_id(
     data: &Value,
     keys: [&str; 2],
     expected: i64,
-    name: &str,
 ) -> Result<(), PurchaseApiError> {
     for field in keys {
         if let Some(value) = data.get(field).filter(|value| !value.is_null()) {
-            let id = value.as_i64().or_else(|| value.as_str()?.parse().ok())
-                .ok_or_else(|| PurchaseApiError::Parse(format!("确认响应的 {field} 无效")))?;
-            if id != expected {
-                return Err(PurchaseApiError::InvalidParameter(format!(
-                    "确认响应的{name} ID {id} 与所选 ID {expected} 不符"
-                )));
-            }
+            validate_echoed_id(value, field, expected)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_echoed_id(value: &Value, field: &str, expected: i64) -> Result<(), PurchaseApiError> {
+    let id = value.as_i64().or_else(|| value.as_str()?.parse().ok())
+        .ok_or_else(|| PurchaseApiError::Parse(format!("响应的 {field} 无效")))?;
+    if id != expected {
+        return Err(PurchaseApiError::InvalidParameter(format!(
+            "响应的 {field} 为 {id}，与所选 ID {expected} 不符"
+        )));
     }
     Ok(())
 }
@@ -547,9 +639,9 @@ fn decode_confirmation(
     let confirm = ConfirmTicketResult::deserialize(data)
         .map_err(|error| PurchaseApiError::Parse(format!("确认参数：{error}")))?;
     for fields in [data, &data["ticket_info"]] {
-        confirm_target_id(fields, ["project_id", "projectId"], target.project_id, "项目")?;
-        confirm_target_id(fields, ["screen_id", "screenId"], target.screen_id, "场次")?;
-        confirm_target_id(fields, ["sku_id", "skuId"], target.sku_id, "票档")?;
+        confirm_target_id(fields, ["project_id", "projectId"], target.project_id)?;
+        confirm_target_id(fields, ["screen_id", "screenId"], target.screen_id)?;
+        confirm_target_id(fields, ["sku_id", "skuId"], target.sku_id)?;
     }
     if confirm.count != target.count || confirm.ticket_info.count != target.count {
         return Err(PurchaseApiError::InvalidParameter(format!(
@@ -852,6 +944,8 @@ pub(crate) mod purchase_test {
         Check,
         Project,
         Clock,
+        Stock,
+        Prewarm,
     }
 
     pub enum Reply {
@@ -871,6 +965,9 @@ pub(crate) mod purchase_test {
     #[derive(Debug)]
     pub struct RecordedRequest {
         pub endpoint: Endpoint,
+        pub method: reqwest::Method,
+        pub account_uid: Option<u64>,
+        pub at: Instant,
         pub body: Option<Value>,
         pub query: Vec<(String, String)>,
     }
@@ -878,6 +975,7 @@ pub(crate) mod purchase_test {
     struct State {
         responses: VecDeque<(Endpoint, Reply)>,
         requests: Vec<RecordedRequest>,
+        project_cache: HashMap<String, Value>,
     }
 
     tokio::task_local! {
@@ -891,6 +989,7 @@ pub(crate) mod purchase_test {
         let state = RefCell::new(State {
             responses: responses.into_iter().collect(),
             requests: Vec::new(),
+            project_cache: HashMap::new(),
         });
         STATE.scope(state, async {
             let result = run.await;
@@ -902,8 +1001,23 @@ pub(crate) mod purchase_test {
         STATE.try_with(|_| ()).is_ok()
     }
 
+    pub fn seed_project_cache(project_id: &str, info: Value) {
+        STATE.with(|state| {
+            state.borrow_mut().project_cache.insert(project_id.to_owned(), info);
+        });
+    }
+
+    pub(super) fn cached_project(project_id: &str) -> Option<InfoResponse> {
+        STATE.with(|state| {
+            state.borrow().project_cache.get(project_id).map(|info| {
+                InfoResponse::deserialize(info).expect("测试项目缓存应可反序列化")
+            })
+        })
+    }
+
     pub(super) fn take_response(request: &Request) -> Option<Reply> {
         STATE.try_with(|state| {
+            let at = Instant::now();
             let endpoint = match request.url().path() {
                 "/api/ticket/order/prepare" => Endpoint::Prepare,
                 "/api/ticket/order/confirmInfo" => Endpoint::Confirm,
@@ -911,6 +1025,8 @@ pub(crate) mod purchase_test {
                 "/api/ticket/order/createstatus" => Endpoint::Check,
                 "/api/ticket/project/getV2" => Endpoint::Project,
                 "/x/click-interface/click/now" => Endpoint::Clock,
+                "/api/ticket/stock/check" => Endpoint::Stock,
+                "/" if request.url().host_str() == Some("show.bilibili.com") => Endpoint::Prewarm,
                 path => panic!("未设置购票测试接口：{path}"),
             };
             let mut state = state.borrow_mut();
@@ -921,7 +1037,18 @@ pub(crate) mod purchase_test {
                 .and_then(reqwest::Body::as_bytes)
                 .map(|bytes| serde_json::from_slice(bytes).expect("请求体应为 JSON"));
             let query = request.url().query_pairs().into_owned().collect();
-            state.requests.push(RecordedRequest { endpoint, body, query });
+            let account_uid = request.headers().get(reqwest::header::COOKIE)
+                .and_then(|header| header.to_str().ok())
+                .and_then(|cookies| cookies.split(';').find_map(|cookie| cookie.trim().strip_prefix("DedeUserID=")))
+                .and_then(|uid| uid.parse().ok());
+            state.requests.push(RecordedRequest {
+                endpoint,
+                method: request.method().clone(),
+                account_uid,
+                at,
+                body,
+                query,
+            });
             reply
         }).ok()
     }
@@ -931,31 +1058,42 @@ pub(crate) mod purchase_test {
         Client::new().get("invalid-url").build().unwrap_err()
     }
 
-    pub(super) async fn resolve_reply(
-        mut reply: Reply,
-        exact_ok: bool,
-    ) -> Result<(Value, Option<Duration>), PurchaseApiError> {
+    async fn complete_reply(mut reply: Reply) -> Reply {
         loop {
             match reply {
-                Reply::Json(value) => return Ok((value, None)),
-                Reply::JsonWithRetryAfter(value, delay) => return Ok((value, Some(delay))),
-                Reply::Raw(body) => return Ok((decode_purchase_body(body)?, None)),
-                Reply::TransportFailure => {
-                    return Err(PurchaseApiError::Transport(synthetic_request_error()));
-                }
-                Reply::ReadBodyFailure => {
-                    return Err(PurchaseApiError::ReadBody(synthetic_request_error()));
-                }
-                Reply::Http(status, retry_after) => {
-                    response_status(status, retry_after, exact_ok)?;
-                    return Ok((decode_purchase_body(&[])?, retry_after));
-                }
                 Reply::Wait { entered, release, reply: next } => {
                     entered.notify_one();
                     release.notified().await;
                     reply = *next;
                 }
+                reply => return reply,
             }
+        }
+    }
+
+    pub(super) async fn resolve_reply(
+        reply: Reply,
+        exact_ok: bool,
+    ) -> Result<(Value, Option<Duration>), PurchaseApiError> {
+        match complete_reply(reply).await {
+            Reply::Json(value) => Ok((value, None)),
+            Reply::JsonWithRetryAfter(value, delay) => Ok((value, Some(delay))),
+            Reply::Raw(body) => Ok((decode_purchase_body(body)?, None)),
+            Reply::TransportFailure => Err(PurchaseApiError::Transport(synthetic_request_error())),
+            Reply::ReadBodyFailure => Err(PurchaseApiError::ReadBody(synthetic_request_error())),
+            Reply::Http(status, retry_after) => {
+                response_status(status, retry_after, exact_ok)?;
+                Ok((decode_purchase_body(&[])?, retry_after))
+            }
+            Reply::Wait { .. } => unreachable!(),
+        }
+    }
+
+    pub(super) async fn resolve_head(reply: Reply) -> Result<(), PurchaseApiError> {
+        match complete_reply(reply).await {
+            Reply::Http(status, retry_after) => response_status(status, retry_after, false),
+            Reply::TransportFailure => Err(PurchaseApiError::Transport(synthetic_request_error())),
+            _ => Ok(()),
         }
     }
 }
@@ -1104,5 +1242,170 @@ mod tests {
         assert!(requests[0].query.iter().all(|(key, _)| key != "orderId"));
         assert!(requests[1].query.contains(&("orderId".into(), "31".into())));
         assert!(requests[1].query.contains(&("token".into(), "query+token".into())));
+    }
+
+    #[tokio::test]
+    async fn stock_check_sends_one_target_and_requires_http_and_business_success() {
+        use purchase_test::{with_responses, Endpoint::Stock, Reply};
+
+        let cookies = Arc::new(CookieManager::from_client(Arc::new(Client::new()), ""));
+        let target = PurchaseTarget::new("7", "11", "13", 2).unwrap();
+        let status_reply = |status| Reply::Json(json!({
+            "code": 0,
+            "data": { "stockStatus": status, "projectId": "7", "screenId": 11, "skuId": 13 }
+        }));
+        let mismatched = Reply::Json(json!({
+            "code": 0,
+            "data": { "stockStatus": 3, "skuId": 14 }
+        }));
+        let ((), requests) = with_responses(
+            [
+                (Stock, status_reply(1)),
+                (Stock, status_reply(2)),
+                (Stock, status_reply(3)),
+                (Stock, status_reply(4)),
+                (Stock, Reply::Json(json!({ "code": 0, "data": {} }))),
+                (Stock, Reply::Json(json!({ "errno": 0, "data": { "stockStatus": 3 } }))),
+                (Stock, Reply::Json(json!({ "code": -400, "data": { "stockStatus": 3 } }))),
+                (Stock, Reply::Http(StatusCode::BAD_GATEWAY, None)),
+                (Stock, mismatched),
+            ],
+            async {
+                for expected in [
+                    StockStatus::Unavailable,
+                    StockStatus::Unavailable,
+                    StockStatus::Available,
+                    StockStatus::Unknown,
+                    StockStatus::Unknown,
+                ] {
+                    assert_eq!(check_stock(cookies.clone(), &target).await.unwrap(), expected);
+                }
+                assert!(matches!(
+                    check_stock(cookies.clone(), &target).await,
+                    Err(PurchaseApiError::Parse(_))
+                ));
+                assert!(matches!(
+                    check_stock(cookies.clone(), &target).await,
+                    Err(PurchaseApiError::Business { code: -400, .. })
+                ));
+                assert!(matches!(
+                    check_stock(cookies.clone(), &target).await,
+                    Err(PurchaseApiError::Http { status: StatusCode::BAD_GATEWAY, .. })
+                ));
+                assert!(matches!(
+                    check_stock(cookies, &target).await,
+                    Err(PurchaseApiError::InvalidParameter(_))
+                ));
+            },
+        ).await;
+
+        for request in requests {
+            assert_eq!(request.method, reqwest::Method::POST);
+            assert_eq!(request.body, Some(json!({ "projectId": "7", "screenId": 11, "skuId": 13 })));
+        }
+    }
+
+    #[tokio::test]
+    async fn live_project_requires_success_and_preserves_original_sale_begin() {
+        use purchase_test::{with_responses, Endpoint::Project, Reply};
+
+        let cookies = Arc::new(CookieManager::from_client(Arc::new(Client::new()), ""));
+        let referer = "https://show.bilibili.com/platform/detail.html?id=7";
+        let data = json!({
+            "id": 7, "name": "测试项目", "id_bind": 2, "hotProject": true,
+            "screen_list": [{
+                "id": 11, "ticket_list": [], "clickable": true,
+                "sale_start": 1000, "sale_end": 3000, "sale_flag_number": 2, "show_date": ""
+            }]
+        });
+        let mut raw = data.clone();
+        raw["sale_begin"] = json!(2000);
+        let mut other_project = data.clone();
+        other_project["id"] = json!(8);
+        with_responses(
+            [
+                (Project, Reply::Json(json!({ "errno": 0, "data": data }))),
+                (Project, Reply::Json(json!({ "code": 0, "data": raw }))),
+                (Project, Reply::Json(json!({ "errno": 103, "data": data }))),
+                (Project, Reply::Json(json!({ "data": data }))),
+                (Project, Reply::Json(json!({ "code": 0, "data": other_project }))),
+                (Project, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
+                (Project, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
+            ],
+            async {
+                let synthesized = get_project_live(cookies.clone(), "7", referer).await.unwrap();
+                assert_eq!(synthesized.data.sale_begin, Some(1000));
+                assert_eq!(synthesized.data.raw_sale_begin, None);
+                let original = get_project(cookies.clone(), "7", referer).await.unwrap();
+                assert_eq!(original.data.sale_begin, Some(2000));
+                assert_eq!(original.data.raw_sale_begin, Some(2000));
+                for message in ["业务码 103", "缺少有效业务码", "与请求项目 7 不符", "HTTP 503"] {
+                    let error = get_project_live(cookies.clone(), "7", referer).await.unwrap_err();
+                    assert!(error.contains(message), "{error}");
+                }
+                let cached = get_project(cookies, "7", referer).await.unwrap();
+                assert_eq!(cached.data.sale_begin, Some(2000));
+                assert_eq!(cached.data.raw_sale_begin, None);
+            },
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn clock_sample_uses_server_seconds_and_falls_back_on_timeout() {
+        use purchase_test::{with_responses, Endpoint::Clock, Reply};
+        use tokio::sync::Notify;
+
+        let cookies = Arc::new(CookieManager::from_client(Arc::new(Client::new()), ""));
+        let fixture_time = json!({ "code": 0, "data": { "now": 1730000000 } });
+        with_responses(
+            [
+                (Clock, Reply::Json(fixture_time.clone())),
+                (Clock, Reply::Wait {
+                    entered: Arc::new(Notify::new()),
+                    release: Arc::new(Notify::new()),
+                    reply: Box::new(Reply::Json(fixture_time)),
+                }),
+            ],
+            async {
+                let before = Instant::now();
+                let server = sample_clock(cookies.clone()).await;
+                assert!(server.from_server);
+                assert_eq!(server.unix_ms, 1730000000000);
+                assert!(server.sampled_at >= before && server.sampled_at <= Instant::now());
+
+                let before = Instant::now();
+                let wall_before = chrono::Utc::now().timestamp_millis();
+                let local = timeout(CLOCK_TIMEOUT + Duration::from_secs(2), sample_clock(cookies))
+                    .await.unwrap();
+                assert!(!local.from_server);
+                assert!((wall_before..=chrono::Utc::now().timestamp_millis()).contains(&local.unix_ms));
+                assert!(local.sampled_at.duration_since(before) >= CLOCK_TIMEOUT);
+                assert!(local.sampled_at <= Instant::now());
+            },
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn prewarm_uses_head_and_accepts_success_without_body() {
+        use purchase_test::{with_responses, Endpoint::Prewarm, Reply};
+
+        let cookies = Arc::new(CookieManager::from_client(Arc::new(Client::new()), ""));
+        let ((), requests) = with_responses(
+            [
+                (Prewarm, Reply::Http(StatusCode::OK, None)),
+                (Prewarm, Reply::Http(StatusCode::SERVICE_UNAVAILABLE, None)),
+            ],
+            async {
+                prewarm_ticket_connection(cookies.clone()).await.unwrap();
+                assert!(matches!(
+                    prewarm_ticket_connection(cookies).await,
+                    Err(PurchaseApiError::Http { status: StatusCode::SERVICE_UNAVAILABLE, .. })
+                ));
+            },
+        ).await;
+        for request in requests {
+            assert_eq!(request.method, reqwest::Method::HEAD);
+            assert!(request.body.is_none() && request.query.is_empty());
+        }
     }
 }

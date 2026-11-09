@@ -336,6 +336,10 @@ pub struct RunningTaskInfo {
     pub phase: GrabPhase,
     /// 开售时间（秒级时间戳），定时模式进入等待后才有
     pub sale_at: Option<i64>,
+    /// 所选目标开售时间加配置延迟，单位毫秒。
+    pub sale_at_ms: Option<i64>,
+    /// 后端按单调时钟期限计算，前端不再从本机墙钟推算。
+    pub remaining_ms: Option<u64>,
     /// 已提交下单次数
     pub attempts: u32,
     /// 捡漏模式已完成的检查轮数

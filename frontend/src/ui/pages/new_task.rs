@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use chrono::TimeZone;
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, CursorIcon, FontId, Key, Label, Layout, Margin, Modifiers,
@@ -212,6 +210,20 @@ fn selected_ticket(app: &Myapp) -> Option<&ScreenTicketInfo> {
     selected_screen(app)?.ticket_list.iter().find(|t| t.id.unwrap_or(0) as i64 == id)
 }
 
+fn purchase_timing(app: &Myapp) -> Result<Option<i64>, String> {
+    app.custom_config.validate_purchase()?;
+    if app.draft.mode != 0 {
+        return Ok(None);
+    }
+    let (Some(project), Some(screen), Some(ticket)) = (
+        app.draft.project.value(), selected_screen(app), selected_ticket(app),
+    ) else { return Ok(None) };
+    let sale_begin = screen.id.zip(ticket.id)
+        .and_then(|(screen_id, ticket_id)| project.target_sale_begin(screen_id, ticket_id))
+        .ok_or_else(|| "所选票种缺少可靠的开售时间，无法定时抢票".to_owned())?;
+    app.custom_config.sale_target_millis(sale_begin).map(Some)
+}
+
 /// 定时模式可选：在售或未开售
 fn timed_selectable(t: &ScreenTicketInfo) -> bool {
     t.clickable == Some(true) || t.sale_flag_number == Some(1)
@@ -310,10 +322,6 @@ fn duplicate_seq(app: &Myapp) -> Option<u64> {
                 .any(|(task_id, u, p, k)| *task_id == t.task_id && *u == uid && *p == pid && *k == tid)
         })
         .map(|t| t.seq)
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 fn fmt_time(ts: i64, fmt: &str) -> String {
@@ -611,10 +619,7 @@ fn mode_card(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
         let ticket_clickable = selected_ticket(app).map(|t| t.clickable == Some(true));
         match mode {
             0 => {
-                ui.label(RichText::new("到开售时间自动开始下单，适合还没开售的项目。").color(p.text_2));
-                if ticket_clickable == Some(true) {
-                    widgets::small(ui, "该票种已在售，开始后会立即下单", p.text_3);
-                }
+                ui.label(RichText::new("按开售时间和延迟设置自动开始下单。").color(p.text_2));
             }
             1 => {
                 ui.label(RichText::new("立即反复下单，只用于已开售的票种。").color(p.text_2));
@@ -1056,13 +1061,13 @@ fn no_bind_fields(app: &mut Myapp, ui: &mut Ui) {
 
 struct Summary {
     rows: Vec<(&'static str, String)>,
-    /// 距开售秒数（模式 0 且有开售时间）
+    /// 按本地时间估算的剩余秒数，含开售延迟。
     countdown: Option<i64>,
     /// (张数, 金额分)；模式 2 为 None，未选票种时金额为 None
     total: Option<(i32, Option<i64>)>,
     ticket_text: String,
     people: usize,
-    missing: Vec<&'static str>,
+    missing: Vec<String>,
     duplicate: Option<u64>,
 }
 
@@ -1104,13 +1109,16 @@ fn summary(app: &Myapp) -> Summary {
         _ => dash(),
     };
 
-    let countdown = if d.mode == 0 {
-        project.and_then(|p| {
-            let screen_start = screen.map(|s| s.sale_start as i64).filter(|t| *t > 0);
-            screen_start.or(p.sale_begin.filter(|t| *t > 0)).map(|t| t - now_secs())
-        })
-    } else {
-        None
+    let mut missing: Vec<_> = missing(app).into_iter().map(str::to_owned).collect();
+    let countdown = match purchase_timing(app) {
+        Ok(target) => target.map(|target| {
+            let left_ms = target.saturating_sub(chrono::Utc::now().timestamp_millis()).max(0) as u64;
+            left_ms.div_ceil(1000) as i64
+        }),
+        Err(error) => {
+            missing.push(error);
+            None
+        }
     };
     let total = (d.mode != 2).then(|| (n, ticket.map(|t| t.price.unwrap_or(0) as i64 * n as i64)));
 
@@ -1135,7 +1143,7 @@ fn summary(app: &Myapp) -> Summary {
             BuyerMode::Single | BuyerMode::Multi => chosen.len(),
             _ => d.count as usize,
         },
-        missing: missing(app),
+        missing,
         duplicate: duplicate_seq(app),
     }
 }
@@ -1180,12 +1188,9 @@ fn summary_panel(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
                         egui::Frame::none().fill(p.sunken).rounding(8.0).inner_margin(12.0).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.spacing_mut().item_spacing.y = 4.0;
-                            widgets::small(ui, "距开售", p.text_3);
-                            let (text, color) = if secs <= 0 {
-                                ("已开售".to_string(), p.text)
-                            } else {
-                                (widgets::countdown_text(secs), if secs <= 10 { p.primary } else { p.text })
-                            };
+                            widgets::small(ui, "距下单（本地预估）", p.text_3);
+                            let text = draft_countdown_text(secs);
+                            let color = if (1..=10).contains(&secs) { p.primary } else { p.text };
                             ui.label(RichText::new(text).font(FontId::monospace(28.0)).color(color));
                         });
                     }
@@ -1242,7 +1247,11 @@ fn clear_link(ui: &mut Ui, p: &Palette) -> Response {
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// 窄宽底栏：左侧一行摘要，右侧主按钮
+fn draft_countdown_text(secs: i64) -> String {
+    if secs == 0 { "可开始下单".into() } else { widgets::countdown_text(secs) }
+}
+
+/// 窄宽底栏：左侧摘要，右侧主按钮
 fn summary_bar(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
     let s = summary(app);
     let mut start = false;
@@ -1263,12 +1272,19 @@ fn summary_bar(app: &mut Myapp, ui: &mut Ui, p: &Palette) {
                 })
                 .inner;
             if let Some(first) = s.missing.first() {
-                resp = resp.on_hover_text(*first);
+                resp = resp.on_hover_text(first.as_str());
             }
             start = resp.clicked();
             clear = clear_link(ui, p).clicked();
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.add(Label::new(RichText::new(left).color(p.text)).truncate(true));
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.add(Label::new(RichText::new(left).color(p.text)).truncate(true));
+                    if let Some(secs) = s.countdown {
+                        let text = format!("本地预估 {}", draft_countdown_text(secs));
+                        ui.add(Label::new(RichText::new(text).size(12.0).color(p.text_3)).truncate(true));
+                    }
+                });
                 if let Some(seq) = s.duplicate {
                     widgets::small(ui, format!("已有相同任务（No.{seq:04}）"), p.warning);
                 }
@@ -1303,6 +1319,10 @@ fn submit(app: &mut Myapp) {
     let Some(account) = app.account(uid).cloned() else { return };
     let Some(cookie_manager) = account.cookie_manager.clone() else { return };
     let ParseResult::Id { id: parsed_id, referer } = app.draft.parsed.clone() else { return };
+    if let Err(error) = purchase_timing(app) {
+        app.toasts.danger(format!("提交任务失败：{error}"));
+        return;
+    }
     let mode = app.draft.mode;
     let chosen = chosen_buyers(app);
     let mut bt = BilibiliTicket::new(
@@ -1401,5 +1421,179 @@ fn submit(app: &mut Myapp) {
             log::error!("提交抢票任务失败: {}", e);
             app.toasts.push(Tone::Danger, format!("提交任务失败：{e}"), None, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use common::account::Account;
+    use common::cookie_manager::CookieManager;
+    use common::push::PushConfig;
+    use common::taskmanager::{FinishedTaskInfo, RunningTaskInfo, TaskManager, TaskResult};
+    use common::utility::CustomConfig;
+    use common::utils::Config;
+    use serde_json::json;
+
+    use crate::app::{AccountManager, AccountsTab, Page, PushTest};
+    use crate::state::draft::TaskDraft;
+    use crate::state::jobs::{Jobs, ServiceState};
+    use crate::state::persist::SaveState;
+    use crate::state::tasks::TasksTab;
+    use crate::state::BuyerList;
+
+    #[derive(Default)]
+    struct CaptureRequests(Arc<Mutex<Vec<GrabTicketRequest>>>);
+
+    impl TaskManager for CaptureRequests {
+        fn new() -> Self { Self::default() }
+        fn submit_task(&mut self, request: TaskRequest) -> Result<String, String> {
+            let TaskRequest::GrabTicketRequest(request) = request else { unreachable!() };
+            self.0.lock().unwrap().push(request);
+            // 只记录实际提交，不运行任务或写入项目历史。
+            Err("测试已截获任务".into())
+        }
+        fn get_results(&mut self) -> Vec<TaskResult> { unreachable!() }
+        fn cancel_task(&mut self, _: &str) -> Result<(), String> { unreachable!() }
+        fn get_task_status(&self, _: &str) -> Option<TaskStatus> { unreachable!() }
+        fn list_running_tasks(&self) -> Vec<RunningTaskInfo> { unreachable!() }
+        fn take_finished_tasks(&mut self) -> Vec<FinishedTaskInfo> { unreachable!() }
+        fn shutdown(&mut self) { unreachable!() }
+    }
+
+    fn app_for_submit(manager: CaptureRequests, sale_start: i64) -> Myapp {
+        let client = reqwest::Client::new();
+        let mut account: Account = serde_json::from_value(json!({
+            "uid": 42, "name": "测试账号", "level": "0", "cookie": "", "csrf": "",
+            "is_login": true, "account_status": "空闲", "vip_label": "", "is_active": true,
+        })).unwrap();
+        account.cookie_manager = Some(Arc::new(CookieManager::from_client(Arc::new(client.clone()), "")));
+        let uid = account.uid;
+        let buyer: BuyerInfo = serde_json::from_value(json!({
+            "id": 123, "uid": uid, "name": "测试购票人", "personal_id": "", "tel": "",
+            "id_type": 0, "is_default": 0,
+        })).unwrap();
+        let project = serde_json::from_value(json!({
+            "id": 100001, "id_bind": 1, "sale_begin": sale_start - 90,
+            "screen_list": [{
+                "id": 5, "clickable": true, "sale_end": 0, "sale_start": sale_start - 60,
+                "sale_flag_number": 1, "show_date": "",
+                "ticket_list": [{"id": 7, "price": 100, "saleStart": sale_start, "sale_flag": {}}],
+            }],
+        })).unwrap();
+        let draft = TaskDraft {
+            account_uid: Some(uid),
+            parsed: parse_project_input("100001"),
+            project: Remote::Ready { value: project, at: Instant::now() },
+            screen_idx: Some(0),
+            ticket_id: Some(7),
+            selected_buyers: vec![buyer.id],
+            ..Default::default()
+        };
+        let custom_config = CustomConfig::new();
+        let mut config = Config::new();
+        config["custom_config"] = serde_json::to_value(&custom_config).unwrap();
+        Myapp {
+            app: String::new(),
+            version: String::new(),
+            policy: None,
+            public_key: String::new(),
+            machine_id: String::new(),
+            task_manager: Box::new(manager),
+            account_manager: AccountManager { accounts: vec![account] },
+            push_config: PushConfig::new(),
+            config,
+            custom_config,
+            client,
+            default_ua: "test".into(),
+            local_captcha: Default::default(),
+            status_delay: 2,
+            announce1: None,
+            announce2: None,
+            announce3: None,
+            announce4: None,
+            default_avatar_texture: None,
+            page: Page::NewTask,
+            dialog: Dialog::None,
+            toasts: Default::default(),
+            draft,
+            project_history: Vec::new(),
+            buyers: [(uid, Remote::Ready {
+                value: BuyerList { list: vec![buyer], from_cache: false },
+                at: Instant::now(),
+            })].into(),
+            orders: Default::default(),
+            board: Default::default(),
+            logs: Default::default(),
+            log_filter: Default::default(),
+            log_panel_open: false,
+            jobs: Jobs::new(),
+            service: ServiceState::Offline,
+            ui_config: Default::default(),
+            contacts: Default::default(),
+            accounts_selected: Some(uid),
+            accounts_tab: AccountsTab::Buyers,
+            avatar_requested: Default::default(),
+            settings_dirty_at: None,
+            settings_save: SaveState::Idle,
+            settings_expanded: [false; 7],
+            push_test: PushTest::Idle,
+            tasks_tab: TasksTab::Running,
+            notice_dismissed: [false; 2],
+            applied_theme: None,
+        }
+    }
+
+    #[test]
+    fn submit_uses_pending_purchase_settings_in_each_mode() {
+        let manager = CaptureRequests::default();
+        let requests = manager.0.clone();
+        let sale_start = 1_800_000_000;
+        let mut app = app_for_submit(manager, sale_start);
+
+        app.custom_config.stock_check = true;
+        app.custom_config.sale_delay_ms = 275;
+        app.custom_config.stock_interval_ms = 3200;
+        app.custom_config.create_interval_ms = 825;
+        app.mark_settings_dirty();
+        assert_eq!(purchase_timing(&app).unwrap(), Some(sale_start * 1000 + 275));
+        submit(&mut app);
+
+        app.custom_config.sale_delay_ms = 875;
+        app.custom_config.stock_interval_ms = 3600;
+        app.mark_settings_dirty();
+        for mode in [1, 2] {
+            app.draft.mode = mode;
+            submit(&mut app);
+        }
+
+        assert!(app.settings_dirty_at.is_some());
+        assert_eq!(app.config["custom_config"]["sale_delay_ms"], 0);
+        let requests = requests.lock().unwrap();
+        let settings: Vec<_> = requests.iter().map(|request| {
+            let config = &request.biliticket.config;
+            (request.grab_mode, config.stock_check, config.sale_delay_ms,
+             config.stock_interval_ms, config.create_interval_ms)
+        }).collect();
+        assert_eq!(settings, [(0, true, 275, 3200, 825), (1, true, 875, 3600, 825), (2, true, 875, 3600, 825)]);
+    }
+
+    #[test]
+    fn summary_and_submit_reject_missing_target_sale_time() {
+        let manager = CaptureRequests::default();
+        let requests = manager.0.clone();
+        let mut app = app_for_submit(manager, 1_800_000_000);
+        let Remote::Ready { value: project, .. } = &mut app.draft.project else { unreachable!() };
+        project.screen_list[0].sale_start = 0;
+        project.screen_list[0].ticket_list[0].saleStart = None;
+
+        let preview = summary(&app);
+        assert!(preview.countdown.is_none());
+        assert!(preview.missing.iter().any(|reason| reason.contains("缺少可靠的开售时间")));
+        submit(&mut app);
+        assert!(requests.lock().unwrap().is_empty());
     }
 }

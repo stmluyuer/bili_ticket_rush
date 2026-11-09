@@ -218,6 +218,9 @@ pub struct TicketInfo {
     #[serde(default)]
     pub express_fee: Option<usize>, //快递费
     pub sale_begin: Option<i64>, //开售时间
+    /// 只保留本次在线响应的原始项目开售时间，缓存无法证明其来源。
+    #[serde(skip)]
+    pub raw_sale_begin: Option<i64>,
     pub sale_end: Option<i64>, //截止时间
     pub count_down: Option<i64>, //倒计时（可能有负数）
     pub screen_list: Vec<ScreenInfo>, //场次列表
@@ -236,7 +239,16 @@ pub struct TicketInfo {
 }
 
 impl TicketInfo {
-    /// 如果 sale_begin 缺失，尝试从 screen_list 中提取开售时间作为 fallback
+    /// 只在指定场次和票档内选时间，项目级回退必须来自在线原始字段。
+    pub fn target_sale_begin(&self, screen_id: usize, ticket_id: usize) -> Option<i64> {
+        let screen = self.screen_list.iter().find(|screen| screen.id == Some(screen_id))?;
+        let ticket = screen.ticket_list.iter().find(|ticket| ticket.id == Some(ticket_id))?;
+        ticket.saleStart.and_then(|time| i64::try_from(time).ok()).filter(|time| *time > 0)
+            .or_else(|| i64::try_from(screen.sale_start).ok().filter(|time| *time > 0))
+            .or(self.raw_sale_begin.filter(|time| *time > 0))
+    }
+
+    /// 为项目展示补齐开售时间；该合成值不参与指定目标的定时回退。
     pub fn fill_missing_sale_begin(&mut self) {
         if self.sale_begin.is_some() {
             return; // 已有值，无需处理
@@ -246,19 +258,11 @@ impl TicketInfo {
 
         // 从 screen_list 中提取时间
         for screen in &self.screen_list {
-            // 1. 尝试 screen.start_time (Option<usize>)
-            if let Some(t) = screen.start_time {
-                if t > 0 {
-                    candidate_times.push(t as i64);
-                }
-            }
-
-            // 2. 尝试 screen.sale_start (usize, 非 Option)
+            // 演出开始时间不是开售时间。
             if screen.sale_start > 0 {
                 candidate_times.push(screen.sale_start as i64);
             }
 
-            // 3. 从 ticket_list 中提取 saleStart
             for ticket in &screen.ticket_list {
                 if let Some(t) = ticket.saleStart {
                     if t > 0 {
@@ -287,9 +291,6 @@ impl TicketInfo {
         }
         if self.name.is_none() {
             missing.push("name(项目名称)");
-        }
-        if self.sale_begin.is_none() {
-            missing.push("sale_begin(开售时间)");
         }
         if self.id_bind.is_none() {
             missing.push("id_bind(实名绑定标识)");
@@ -463,4 +464,65 @@ pub struct NoBindBuyerInfo {
     pub name: String,
     pub tel: String,
     pub uid: i64,
+}
+
+#[cfg(test)]
+mod sale_time_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn project() -> TicketInfo {
+        serde_json::from_value(json!({
+            "id": 1, "name": "测试项目", "sale_begin": 100, "id_bind": 1, "hotProject": false,
+            "screen_list": [
+                {"id": 10, "start_time": 5, "sale_start": 200, "sale_end": 900,
+                 "clickable": true, "sale_flag_number": 2, "show_date": "",
+                 "ticket_list": [
+                    {"id": 11, "saleStart": 300, "sale_flag": {}},
+                    {"id": 12, "sale_flag": {}}
+                 ]},
+                {"id": 20, "start_time": 6, "sale_start": 0, "sale_end": 900,
+                 "clickable": true, "sale_flag_number": 2, "show_date": "",
+                 "ticket_list": [{"id": 21, "sale_flag": {}}]}
+            ]
+        })).unwrap()
+    }
+
+    #[test]
+    fn selected_target_uses_its_own_sale_time() {
+        let mut project = project();
+        project.raw_sale_begin = project.sale_begin;
+        assert_eq!(project.target_sale_begin(10, 11), Some(300));
+        assert_eq!(project.target_sale_begin(10, 12), Some(200));
+        assert_eq!(project.target_sale_begin(20, 21), Some(100));
+        assert_eq!(project.target_sale_begin(20, 11), None);
+        assert_eq!(project.target_sale_begin(99, 21), None);
+    }
+
+    #[test]
+    fn cache_cannot_restore_online_project_time_provenance() {
+        let mut online = project();
+        online.raw_sale_begin = online.sale_begin;
+        let cached: TicketInfo = serde_json::from_str(&serde_json::to_string(&online).unwrap()).unwrap();
+        assert_eq!(cached.sale_begin, Some(100));
+        assert_eq!(cached.raw_sale_begin, None);
+        assert_eq!(cached.target_sale_begin(10, 11), Some(300));
+        assert_eq!(cached.target_sale_begin(10, 12), Some(200));
+        assert_eq!(cached.target_sale_begin(20, 21), None);
+    }
+
+    #[test]
+    fn synthesized_time_and_performance_time_do_not_schedule_another_target() {
+        let mut project = project();
+        project.sale_begin = None;
+        project.fill_missing_sale_begin();
+        assert_eq!(project.sale_begin, Some(200));
+        assert_eq!(project.target_sale_begin(20, 21), None);
+        project.screen_list[0].sale_start = 0;
+        project.screen_list[0].ticket_list[0].saleStart = None;
+        project.sale_begin = None;
+        project.fill_missing_sale_begin();
+        assert_eq!(project.sale_begin, None);
+        assert!(project.validate().is_ok());
+    }
 }

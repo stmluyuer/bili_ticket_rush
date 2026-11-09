@@ -126,6 +126,8 @@ mod tests {
                 elapsed_secs: 1,
                 phase: GrabPhase::CheckingOrder,
                 sale_at: None,
+                sale_at_ms: None,
+                remaining_ms: None,
                 attempts: 1,
                 rounds: 0,
                 last_event: None,

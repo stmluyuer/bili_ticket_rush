@@ -1,5 +1,5 @@
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
 use common::taskmanager::{GrabPhase, OrderState, RunningTaskInfo, TaskOutcome, TaskStatus};
 use eframe::egui::{
@@ -407,13 +407,11 @@ fn card_stub(
         None => match info.phase {
             GrabPhase::Preparing => busy(ui, "正在准备"),
             GrabPhase::WaitingSale => {
-                widgets::small(ui, "距开售", p.text_3);
-                match info.sale_at {
-                    Some(sale_at) => {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-                        let left = sale_at - now;
-                        let color = if left <= 10 { p.primary } else { p.text };
-                        metric(ui, "", widgets::countdown_text(left), "", color);
+                widgets::small(ui, "距下单", p.text_3);
+                match info.remaining_ms {
+                    Some(left_ms) => {
+                        let color = if left_ms <= 10_000 { p.primary } else { p.text };
+                        metric(ui, "", widgets::countdown_text(left_ms.div_ceil(1000) as i64), "", color);
                     }
                     None => metric(ui, "", "--:--:--".into(), "", p.text_3),
                 }
